@@ -65,7 +65,7 @@ at `agent-langgraph` on a laptop.
 | Variable             | Default                            | Meaning                                                             |
 | -------------------- | ---------------------------------- | ------------------------------------------------------------------- |
 | `PORT`               | `3001`                             | API server port. `SERVER_PORT` names the same port; set either, or both to the same value, or the server refuses to start. |
-| `OPENBOT_EDITION`    | `team`                             | `personal` runs OpenBot for one person with no sign-in, one computer and no Admin. See [personal-edition.md](personal-edition.md). Any value other than `team` or `personal` refuses to start. `personal` also refuses to start with a sign-in provider or `OPENBOT_ORGANIZATION_AUTH_URL` configured, without `OPENBOT_SINGLE_USER=true`, or without one shared computer (`AGENT_COMPUTER_URL`, with no `COMPUTER_SUPERVISOR_URL` or `COMPUTER_SANDBOX_NAMESPACE`). |
+| `OPENBOT_EDITION`    | `team`                             | `personal` runs OpenBot for one person with no sign-in and one computer, who is its admin. See [personal-edition.md](personal-edition.md). Any value other than `team` or `personal` refuses to start. `personal` also refuses to start with a sign-in provider or `OPENBOT_ORGANIZATION_AUTH_URL` configured, without `OPENBOT_SINGLE_USER=true`, or without one shared computer (`AGENT_COMPUTER_URL`, with no `COMPUTER_SUPERVISOR_URL` or `COMPUTER_SANDBOX_NAMESPACE`). |
 | `NODE_ENV`           | unset                              | `production` refuses the example `KEY_ENCRYPTION_KEY` and `AGENT_COMPUTER_ALLOW_PRIVATE_HOSTS=true`. It does not decide whether sign-in is required; see `OPENBOT_SINGLE_USER`. |
 | `TENANT_PACKAGE_DIR` | `../examples/fintech`              | Tenant package directory, resolved from `server/`.                  |
 | `DEPLOYMENT_ID`      | the tenant package's id            | Names this deployment inside a shared Intelligence project, and prefixes the identity a Shared app's account is held under at the vendor. That identity is fixed when the app is made Shared, so changing this later does not move it. |
@@ -95,6 +95,7 @@ at `agent-langgraph` on a laptop.
 | `OPENBOT_SELF_HOST_BANNER` | unset (banner on)               | Set `false` or `0` to hide the bar offering help self-hosting OpenBot, for everybody. It never shows on a paid Intelligence plan, and each person can also close it for themselves. |
 | `OPENBOT_ACCESSIBILITY_DISABLED` | unset | `true` or `1` stops naming OpenBot on the analytics the runtime already sends. |
 | `OPENBOT_PRODUCT_TELEMETRY` | unset (off; on for OpenBot Desktop) | `1` or `true` sends OpenBot's product usage events; `0` turns them off. `DO_NOT_TRACK` or `COPILOTKIT_TELEMETRY_DISABLED` set to `1` or `true` turns them off whatever this says. See [TELEMETRY.md](TELEMETRY.md). |
+| `OPENBOT_ALLOW_LOOPBACK_MCP` | unset                      | `1` lets an MCP server on this machine's loopback address (`http://127.0.0.1:<port>` or `[::1]`) be added by its address, for developing an MCP server against OpenBot and for the end-to-end tests. Leave it unset everywhere people use OpenBot: every other private, local or plain-http address stays refused either way. |
 | `COMPOSIO_API_KEY`   | provisioned during desktop sign-in or local setup when no broker is configured | One project key for the whole deployment. Desktop sign-in saves a provisioned key in native protected storage and supplies it on Start/restart. A key in `.env` or the environment always wins and is never moved. `start.sh` / `bun run setup:composio` uses the existing CLI login; supplied keys and Arcade are preserved. Direct server/container launches still need the prepared key. See [Composio](plugins/composio.md). |
 | `COMPOSIO_<SLUG>_CLIENT_ID`, `COMPOSIO_<SLUG>_CLIENT_SECRET` | unset | This deployment's own OAuth client for one Composio app that connects with a server-to-server grant (`S2S_OAUTH2`), such as `COMPOSIO_SHOPIFY_CLIENT_ID`. Both or neither. Set, the app can be enabled and connected as one shared account; unset, it stays hidden. Read only when the app is enabled; see [rotating the client](#rotating-a-composio-apps-own-client). See [Composio](plugins/composio.md#the-56-that-are-not-offered). |
 | `OPENBOT_INSTALLATION_ID` | a fresh private UUID in `.env.openbot-installation-id` | Stable Composio provisioning identity, persisted before a request. Optional explicit UUID for first setup; later values must match the saved file. Retain it for retries and restarts, and generate a fresh identity for a new installation. It never falls back to `DEPLOYMENT_ID`. |
@@ -196,14 +197,14 @@ To rotate the secret, do one of these:
   `(OpenBot)` config for the app and replace the client secret. The shared account, its grants and
   every Bot that uses it stay as they are. Set the new value in the environment as well, so a config
   created later carries it.
-- **Turn the app off and on again.** Set the new values, restart, then on the app's Plugins page
+- **Turn the app off and on again.** Set the new values, restart, then on the app's page under Apps
   turn **Enable for this deployment** off and back on. Turning it off deletes the config at Composio
   and ends the shared account and every Bot's grant on the app. Turning it on creates a new config
   with the new client. Then make the app shared, connect the team account and grant it to Bots again.
 
 An app on its own client connects only as one shared account. Because the credential is this
 deployment's client, a personal account would give anyone who can see the app its full access, so
-**Connect** refuses one and the screens don't offer it. Make the app shared on its Plugins page, and
+**Connect** refuses one and the screens don't offer it. Make the app shared on its page under Apps, and
 an administrator connects it there.
 
 ## The provider spec file
@@ -570,7 +571,7 @@ where `<provider>` is `google`, `microsoft` or `okta`.
 
 `OPENBOT_PUBLIC_URL` and `OPENBOT_APP_URL` matter only for a connector each person connects their own account to, such as Google Drive.
 
-`OPENBOT_PUBLIC_URL` builds the redirect URI the vendor sends somebody back to after they consent, which has to match what an administrator registered with that vendor character for character — so it comes from configuration rather than from the incoming request. Most deployments never set it, because `BETTER_AUTH_URL` is already the same public address. With neither, the Plugins page says the deployment cannot complete a consent flow, and no account can be connected.
+`OPENBOT_PUBLIC_URL` builds the redirect URI the vendor sends somebody back to after they consent, which has to match what an administrator registered with that vendor character for character — so it comes from configuration rather than from the incoming request. Most deployments never set it, because `BETTER_AUTH_URL` is already the same public address. With neither, the Apps page says the deployment cannot complete a consent flow, and no account can be connected.
 
 `OPENBOT_APP_URL` is where the callback sends the person afterwards. It is a separate setting because the app and the API are separate addresses: locally the app is Vite on `3010` and the API is `3001`, so a relative redirect would land on the API, which serves no pages. A deployment serving both from one origin can leave it unset.
 
@@ -596,7 +597,7 @@ expired, or whose admin has not granted OpenBot access to the system or to OpenB
 so in those words.
 Marking a server this way needs Microsoft sign-in configured. Adding the same server again without
 `entraScope` keeps the mark; send `"entraScope": null` to reach it on a token again. The server's
-page under Plugins shows the mark and its scope.
+page under Apps shows the mark and its scope.
 
 **Apps can call OpenBot with an Entra token.** An app that signed somebody in with Entra asks for a
 token to `MICROSOFT_OAUTH_API_SCOPE` and sends it as `Authorization: Bearer <token>` on any API or
@@ -665,10 +666,10 @@ zero or more: a deployment that typed `two` and silently got the default would b
 cap.
 
 Which Bots may address which is a grant, not a variable, and no Bot may address any other until one
-is made. It is made on the Bot's own page: open it from **Bots**, choose **Skills and access**, and switch on each Bot under
-**Bots it may ask**. The pair is directional: that list is who this Bot may ask, not who may ask it,
-so letting them ask each other is two switches. Only an administrator may change it; anyone who can
-see the Bot can read it.
+is made. It is made on the Bot's own page: open it from **Bots**, choose **Setup**, and switch on
+each Bot under **Bots it can ask**. The pair is directional: that list is who this Bot may ask, not
+who may ask it, so letting them ask each other is two switches. Only an administrator may change it;
+anyone who can see the Bot can read it. The personal edition does not show this section.
 
 With both caps above at zero the screen says the capability is switched off, because a grant made
 then is a row nothing will read.
@@ -819,7 +820,7 @@ them, including a saved off. See [automatic-learning.md](automatic-learning.md).
 ## OpenTelemetry export
 
 Every audit row is also sent as an OTLP log record over HTTP, so a SIEM or an OpenTelemetry
-Collector receives the same events the **Audit** page shows, as they happen. Each record carries
+Collector receives the same events the **Activity** page shows, as they happen. Each record carries
 `openbot.surface`: `bot`, `identity` or `control_plane`. Export never stops a request: when the
 collector cannot be reached, records are dropped after the SDK's retries, and the row in PostgreSQL
 is still the record.

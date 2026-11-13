@@ -139,6 +139,7 @@ function serverRecord(row: { id: string; url: string }): ServerRecord {
     lastError: null,
     addedBy: null,
     dynamicClient: false,
+    signIn: false,
     skippedTools: [],
     authScheme: null,
     accountMode: null,
@@ -465,7 +466,10 @@ function grantsApp(
  * the personal edition's one person, so that edition is served its own.
  */
 describe("what the Plugins page says each app is", () => {
-  async function summaries(): Promise<Record<string, string>> {
+  /** `added` is the servers already added, by id: the catalogue keeps those whatever the edition. */
+  async function summaries(
+    added: string[] = [],
+  ): Promise<Record<string, string>> {
     const app = createApp(
       loadConfig(testEnvironment()),
       {
@@ -474,7 +478,11 @@ describe("what the Plugins page says each app is", () => {
       } as never,
       { rolesForUser: async () => ["admin"] },
       ...UP_TO_PLUGIN_STORE,
-      pluginStore({ listServers: async () => [], listSkills: async () => [] }),
+      pluginStore({
+        listServers: async () =>
+          added.map((id) => ({ id }) as unknown as ServerRecord),
+        listSkills: async () => [],
+      }),
     );
     const response = await app.request("http://openbot.test/api/plugins");
     const body = (await response.json()) as {
@@ -495,7 +503,7 @@ describe("what the Plugins page says each app is", () => {
   test("the personal edition is spoken to as you, and names no deployment", async () => {
     setEdition("personal");
     try {
-      const said = await summaries();
+      const said = await summaries(["notion", "google-drive"]);
       expect(said.notion).toBe("Your pages and databases.");
       expect(said["google-drive"]).toBe("Files in your Drive.");
       expect(said["exa-authenticated"]).toBe(
@@ -510,6 +518,28 @@ describe("what the Plugins page says each app is", () => {
     } finally {
       setEdition("team");
     }
+  });
+
+  test("the personal edition offers Notion and Google Drive through its broker, not its own catalogue", async () => {
+    setEdition("personal");
+    try {
+      const offered = Object.keys(await summaries());
+      expect(offered).not.toContain("notion");
+      expect(offered).not.toContain("google-drive");
+      // The search providers stay.
+      for (const key of ["parallel", "exa", "firecrawl"])
+        expect(offered).toContain(key);
+      // One already added is still listed, so a working connection never disappears from the page.
+      expect(Object.keys(await summaries(["notion"]))).toContain("notion");
+    } finally {
+      setEdition("team");
+    }
+  });
+
+  test("the team edition offers both", async () => {
+    const offered = Object.keys(await summaries());
+    expect(offered).toContain("notion");
+    expect(offered).toContain("google-drive");
   });
 
   test("the team edition keeps its words", async () => {

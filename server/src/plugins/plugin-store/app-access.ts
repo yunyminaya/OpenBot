@@ -45,10 +45,13 @@ import {
 import type { BrokerApp, BrokerConnection } from "../broker";
 import {
   CATALOGUE,
+  type CatalogueAuth,
   type CatalogueEntry,
   catalogueEntry,
   classifyTool,
+  offeredHere,
 } from "../catalogue";
+import { authOf, type RemoteOAuthConfig } from "../remote-oauth";
 import type { StoreContext } from "./context";
 import { iso } from "./model";
 
@@ -71,6 +74,11 @@ type AppCandidate = {
   rowIds: string[];
   toolkit: string | null;
   entry: CatalogueEntry | null;
+  /**
+   * How it is reached, in the catalogue's words: the entry's auth, or for a server added by URL that
+   * signs people in, the `user-oauth` shape `remoteOAuthAuth` gives it. See `authOf`.
+   */
+  auth: CatalogueAuth | null;
   authScheme: string | null;
   /** How the directory says an app with no row connects. See {@link AppAccessFacts.listedConnect}. */
   listedConnect: AppConnect;
@@ -97,6 +105,7 @@ type ServerRow = {
   accountMode: "personal" | "shared" | null;
   credentialId: string | null;
   ownerGrants: OwnerGrants | null;
+  oauth: RemoteOAuthConfig | null;
 };
 
 /** An app a person could give their own Bots. See `giveableApps`. */
@@ -211,6 +220,7 @@ export function appAccessMethods(context: StoreContext) {
         accountMode: mcpServers.accountMode,
         credentialId: mcpServers.credentialId,
         ownerGrants: mcpServers.ownerGrants,
+        oauth: mcpServers.oauth,
       })
       .from(mcpServers)
       .orderBy(asc(mcpServers.id));
@@ -259,6 +269,7 @@ export function appAccessMethods(context: StoreContext) {
           rowIds: [],
           toolkit,
           entry,
+          auth: toolkit ? null : authOf(entry, source),
           authScheme: toolkit ? (head?.authScheme ?? null) : source.authScheme,
           listedConnect: null,
           accountMode: toolkit ? (head?.accountMode ?? null) : null,
@@ -301,6 +312,7 @@ export function appAccessMethods(context: StoreContext) {
       rowIds: [],
       toolkit: input.toolkit ?? null,
       entry: input.entry ?? null,
+      auth: input.entry?.auth ?? null,
       authScheme: null,
       listedConnect: input.listedConnect ?? null,
       accountMode: null,
@@ -423,8 +435,10 @@ export function appAccessMethods(context: StoreContext) {
       for (const candidate of enabled)
         if (candidate.toolkit === wanted) return candidate;
 
+    // An app this edition doesn't offer is offered only once added; until then the broker's
+    // directory below answers for it (the personal edition's Notion and Google Drive).
     const keyed = catalogueEntry(lower);
-    if (keyed)
+    if (keyed && (offeredHere(keyed) || byRow.has(keyed.key)))
       return byRow.get(keyed.key) ?? absentFor(keyed.key, undefined, null);
 
     const titled = enabled.filter(
@@ -435,7 +449,9 @@ export function appAccessMethods(context: StoreContext) {
     );
     if (held ?? titled[0]) return held ?? titled[0] ?? null;
 
-    const entry = CATALOGUE.find((item) => item.title.toLowerCase() === lower);
+    const entry = CATALOGUE.find(
+      (item) => item.title.toLowerCase() === lower && offeredHere(item),
+    );
     if (entry) return absentFor(entry.key, undefined, null);
 
     const listed = await readDirectory(directory);
@@ -448,6 +464,9 @@ export function appAccessMethods(context: StoreContext) {
           candidate.slug === slug || candidate.name.toLowerCase() === lower,
       );
     if (named) return absentFor(`${idPrefix}${named.slug}`, undefined, listed);
+    // The key of an entry this edition doesn't offer names nothing here until it is added.
+    const unoffered = catalogueEntry(asked);
+    if (unoffered && !offeredHere(unoffered)) return null;
     return absentFor(isBrokeredId(lower) ? lower : asked, undefined, listed);
   }
 
@@ -504,12 +523,20 @@ export function appAccessMethods(context: StoreContext) {
    * false) — the one of `brokeredConnectionsFor`'s four states that is a dead key. A held one is
    * usable unless its credential was withdrawn.
    */
+  /**
+   * Whether a person's own connection to this app is a held grant (`mcp_user_credentials`): a
+   * catalogue vendor, or a server added by URL that signs each person in.
+   */
+  const heldPerPerson = (app: AppCandidate) =>
+    app.provider === "catalogue" ||
+    (app.provider === "custom" && app.auth?.kind === "user-oauth");
+
   async function connectionFacts(apps: AppCandidate[], userId: string | null) {
     const toolkits = [
       ...new Set(apps.map((app) => app.toolkit).filter((t) => t !== null)),
     ] as string[];
     const heldIds = apps
-      .filter((app) => app.provider === "catalogue" && app.present)
+      .filter((app) => heldPerPerson(app) && app.present)
       .flatMap((app) => app.rowIds);
     const usable = (row: { verified: boolean; probeAction: string | null }) =>
       !(row.probeAction !== null && !row.verified);
@@ -729,7 +756,7 @@ export function appAccessMethods(context: StoreContext) {
     ) =>
       brokeredProvenance(app.provider) && app.toolkit
         ? found.personalBrokered.get(app.toolkit)
-        : app.provider === "catalogue"
+        : heldPerPerson(app)
           ? app.rowIds
               .map((id) => found.personalHeld.get(id))
               .find((value) => value !== undefined)
@@ -760,7 +787,7 @@ export function appAccessMethods(context: StoreContext) {
           authScheme: app.authScheme,
           listedConnect: app.listedConnect,
           accountMode: app.accountMode,
-          catalogueAuth: app.entry?.auth ?? null,
+          catalogueAuth: app.auth,
           hasCredential: app.hasCredential,
           granted: held.length > 0,
           ownerGrants: app.ownerGrants,
@@ -1017,7 +1044,7 @@ export function appAccessMethods(context: StoreContext) {
         const own =
           brokeredProvenance(app.provider) && app.toolkit
             ? connections.personalBrokered.get(app.toolkit)
-            : app.provider === "catalogue"
+            : heldPerPerson(app)
               ? app.rowIds
                   .map((id) => connections.personalHeld.get(id))
                   .find((value) => value !== undefined)
@@ -1029,7 +1056,7 @@ export function appAccessMethods(context: StoreContext) {
           authScheme: app.authScheme,
           listedConnect: app.listedConnect,
           accountMode: app.accountMode,
-          catalogueAuth: app.entry?.auth ?? null,
+          catalogueAuth: app.auth,
           hasCredential: app.hasCredential,
           granted: false,
           ownerGrants: app.ownerGrants,

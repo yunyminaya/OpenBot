@@ -198,8 +198,8 @@ pub enum Reason {
     DashboardUnavailable,
     /// `login`: the CLI could not open the browser. Its fallback is a code approved in a terminal.
     BrowserOpenFailed,
-    /// The CLI's own resource check: the engine has too few free CPUs, or too little free memory
-    /// or disk. Read from `error.code`, since its `nextAction.reason` is only
+    /// The CLI's own resource check: the engine has too few CPUs in total, or too little free
+    /// memory or disk. Read from `error.code`, since its `nextAction.reason` is only
     /// `local_command_failed`. Which of them is short is the report's `shortfall`.
     ResourcesShort,
     /// A reason this build does not know. Treated as blocking, never as success.
@@ -1439,8 +1439,9 @@ fn reason(outcome: Outcome, wire: &Map<String, Value>) -> Result<Option<Reason>,
 
 /**
 The `error.code` the CLI gives when its resource check fails (`LocalResourceShortfallError`): too
-few free CPUs, too little free memory or too little free storage in the engine. A probe that could
-not measure (`LOCAL_DOCKER_RESOURCES_UNMEASURABLE`) is not a shortfall and stays a plain failure.
+few CPUs in total, too little free memory or too little free storage in the engine. A probe that
+could not measure (`LOCAL_DOCKER_RESOURCES_UNMEASURABLE`) is not a shortfall and stays a plain
+failure.
 */
 const RESOURCES_SHORT: &str = "LOCAL_DOCKER_RESOURCES_SHORT";
 const MEMORY_SHORT: &str = "LOCAL_DOCKER_MEMORY_SHORT";
@@ -1511,16 +1512,22 @@ fn on_podman() -> bool {
     cli_engine().is_some_and(|address| address.engine == crate::engine::Engine::Podman)
 }
 
+/// The Podman machine the CLI runs on, by name, when it runs on one (`acquire::machine_reached`).
+pub fn engine_machine() -> Option<String> {
+    cli_engine().and_then(|address| crate::acquire::machine_reached(&address))
+}
+
 const GIB: u64 = 1024 * 1024 * 1024;
 
 /**
 The smallest engine OpenBot lets through before local setup: 4 CPUs, 4 GiB of memory and 40 GiB of
 free disk.
 
-The CLI's own check wants 4 free CPUs and 4 GiB of free memory inside a container, so an engine
-below those totals can never pass it. Anything larger is left to the CLI at Start: OpenBot's own
-Podman machine is 4 CPUs and 6 GiB and passes there, so a stricter total here would stop every
-Podman install. Free disk is the CLI's own 40 GiB, measured as it measures it, inside a container.
+The CLI's own check wants 4 CPUs in the engine's total, whatever already runs on it, and 4 GiB of
+free memory inside a container, so an engine below those totals can never pass it. Anything larger
+is left to the CLI at Start: OpenBot's own Podman machine is 4 CPUs and 6 GiB and passes there, so
+a stricter total here would stop every Podman install. Free disk is the CLI's own 40 GiB, measured
+as it measures it, inside a container.
 */
 pub const MIN_ENGINE_CPUS: u64 = 4;
 pub const MIN_ENGINE_MEMORY_BYTES: u64 = 4 * GIB;
@@ -7106,6 +7113,16 @@ case "$1" in
     case "$(cat "$S/status")" in
       pending-*) echo "Error: UPGRADE FAILED: another operation (install/upgrade/rollback) is in progress" >&2; exit 1 ;;
     esac
+    # An upgrade that fails leaves its revision `failed`, as Helm does.
+    case "$*" in
+      *stopped.yaml*)
+        if [ -e "$S/fail-install-once" ]; then
+          rm "$S/fail-install-once"
+          echo failed > "$S/status"
+          echo "Error: UPGRADE FAILED: context deadline exceeded" >&2
+          exit 1
+        fi ;;
+    esac
     case "$*" in
       *stopped.yaml*) echo cpki-app-api > "$S/deployments" ;;
       *) printf 'cpki-app-api\ncpki-learning-reconciler\ncpki-learning-agent\n' > "$S/deployments" ;;
@@ -7364,6 +7381,64 @@ printf '%s' '{completed}'
                 .filter(|call| call.starts_with("cli local update"))
                 .count(),
             2
+        );
+    }
+
+    /**
+    A RELEASE AN UPDATE LEFT `failed` IS NOT REPAIRED, AND THE NEXT UPDATE FINISHES ON IT.
+
+    Found in a dogfooding report, 0.16.0-rc.10 to rc.11: the update's first `helm upgrade`
+    (`dependencies-install`) failed once, after `update-quiesce` had paused the services. Helm marks
+    that revision `failed`, and Helm 3 upgrades such a release from its last deployed revision, so
+    there is nothing to roll back or put back: the update is left to fail as it did, and the
+    window's next one (on Retry) runs to the end.
+    */
+    #[test]
+    #[cfg(unix)]
+    fn a_release_an_update_left_failed_is_not_repaired_and_the_next_update_finishes() {
+        if crate::test_support::isolated_process(
+            "local_eval::tests::a_release_an_update_left_failed_is_not_repaired_and_the_next_update_finishes",
+        ) {
+            return;
+        }
+        let world = UpdateWorld::new("update-failed-release");
+        world.set("fail-install-once", "");
+
+        let first = world.update("failed-update", &Cancel::default()).unwrap();
+
+        assert_eq!(first.outcome, Outcome::Failed, "{:?}", world.calls());
+        assert!(!world.finished());
+        let calls = world.calls();
+        assert!(
+            calls.iter().any(|call| call.starts_with("helm list")),
+            "the repair looked at the release: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|call| call.starts_with("helm rollback") || call.contains("values.yaml")),
+            "a failed release is neither rolled back nor re-applied: {calls:?}"
+        );
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| call.starts_with("cli local update"))
+                .count(),
+            1,
+            "nothing repaired, so not retried here: {calls:?}"
+        );
+
+        let next = world.update("next-update", &Cancel::default()).unwrap();
+
+        assert_eq!(next.outcome, Outcome::Completed, "{:?}", world.calls());
+        assert!(world.finished());
+        assert!(
+            !world
+                .calls()
+                .iter()
+                .any(|call| call.starts_with("helm rollback")),
+            "{:?}",
+            world.calls()
         );
     }
 
@@ -9433,7 +9508,7 @@ fn main() {{
                 false,
                 false,
             ),
-            // Fewer than 4 CPUs can never leave the CLI 4 free ones.
+            // Fewer than 4 CPUs can never meet the CLI's 4.
             (
                 "3 8217473024
 ",
