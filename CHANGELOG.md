@@ -8,18 +8,1389 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 ## Unreleased
 
-**Before upgrading.** Two migrations run at start, and the database moves from
-`0088_approval_reviewer_guidance` to `0090_routine_goal_linked_by_run`. `0089_goal_ends_when_met`
-adds an `ends_when_met` column to `responsibilities`, false on every existing goal, so existing
-goals behave as before. `0090_routine_goal_linked_by_run` adds a `goal_linked_by_run` column to
-`routines`, false on every existing routine, so a routine that already records a goal is read as
-made for that goal. Linking a broad routine to a goal one of its firings ran is new in this release,
-so a deployment upgrading from a tagged release has no such routine; one running `main` since that
-change has its broad routines read as made for their goal too, so completing that goal switches
-them off, and deleting it deletes them, rather than unlinking them. No existing row is rewritten
-and nothing is dropped. Upgrading from 1.0.0 or 0.3.x also runs the migrations listed under 1.0.1. A database that has run them does not go back: restore the backup taken before
-the upgrade instead. Three things change for an existing OpenBot Desktop installation, and one for
-every deployment:
+**Before upgrading.**
+
+- **One migration, expand only.** `0138_management_enrollment` adds one table for connecting to
+  managed updates (below), which 1.1.2 never reads, so 1.1.2 upgrades with its servers rolling one
+  by one, with no downtime, and goes back to 1.1.2 the same way.
+- **Deprecated.** Each still works, answers with `Deprecation` and `Sunset` headers, and is
+  removed no earlier than its sunset, and only once nothing uses it.
+  - `PATCH /api/v2/organizations/{organizationId}/people/{personId} body role`: Sunset 2028-05-19.
+    Change a member's role with `PATCH /api/v2/organizations/{organizationId}/members/{personId}`
+    (`updateOrganizationMember`) instead.
+
+### API
+
+- **Delete an organization.** `DELETE /api/v2/organizations/{organizationId}/profile`
+  (`deleteOrganization`) deletes an organization and what is in it, for an owner of it. A person's
+  own organization and `default` stay, refused with 409 `CONFLICT`.
+- **An API key acts in the organization it was made in.** A key made in one organization is refused
+  in any other, as if that organization did not exist. A key in an answer carries `organizationId`.
+  A key made before this release acts in `default`.
+- **An organization's own OAuth client for a server-to-server app.** `createCredential` takes
+  `kind: mcp_oauth_client` with the app's slug as `provider`, `keyId: server-to-server`, the
+  client's id as `metadata.clientId` and its secret as `secret`. The organization's app connects
+  with that client, and the app is offered to the organization once it is kept.
+- **The realtime socket at an address that names the organization.**
+  `/api/v2/organizations/{organizationId}/realtime/websocket` relays the same socket as
+  `/api/intelligence/client/websocket`, for a caller who is a member of that organization.
+- **Push notifications per organization.** A phone registered under an organization's address gets
+  push notifications from the person's Bots in that organization only.
+- **This OpenBot's own audit trail.** `GET /api/v2/organizations/{organizationId}/deployment/audit-events`
+  (`listDeploymentAuditEvents`) lists what happened to the installation and to no organization, for
+  the admin who runs it. Where OpenBot keeps one organization, those events stay on its trail.
+- **Require SSO per organization.** Where OpenBot may keep more than one organization, each one's
+  admins require single sign-on of its own members, and saving it signs out only that
+  organization's members. Where it keeps one, the rule still holds for everybody.
+- **Signing in through the company, per organization.** A member of an organization that requires
+  its company sign-in, who hasn't used it, is refused there with 403 `SSO_REQUIRED`.
+  `GET /api/v2/organizations/{organizationId}/people/me/company-sign-in` (`getCompanySignIn`) still
+  answers them: whether it is required, whether they meet it, and the identity providers they can
+  use. In an organization other than `default`, the identity providers list also holds the ones
+  registered for the whole OpenBot, marked `deployment`, which can't be removed there (403). They
+  count for that organization's Require SSO only while it has no identity provider of its own.
+  An app links a company account through `createCompanySignInTicket`
+  (`POST .../people/me/company-sign-in/tickets`): a two-minute address, opened once in the system
+  browser, that signs in through the chosen provider and links the account there. With
+  `returnTo: app`, the browser goes back to the phone app once the account is linked.
+- **Members who haven't opened OpenBot yet.** On a hosted OpenBot, an organization's members list
+  includes people who are members at OpenBot by CopilotKit and haven't opened OpenBot yet, marked
+  `notOpenedYet`. An owner or an admin can remove them; they can't be given another role until they
+  open OpenBot.
+- **The Recorder can say which organization it records into.** Who a Recorder acts as carries its
+  `organization`, with its id and name, and a new Recorder connection carries `organizationName`.
+- **Search an organization's members.** `listOrganizationMembers` takes `search`, which narrows the
+  list to the members whose name or address starts with it or holds it, ignoring case, best
+  matches first. Only that organization's current members are ever listed.
+- New optional fields: `organizationId` on a conversation event and on a Recorder connection, and
+  `hostedSignIn` on `deployment`, true where people sign in through OpenBot by CopilotKit's own
+  sign-in, starting at `/api/auth/hosted/sign-in`.
+
+### OpenBot Desktop
+
+- **OpenBot Desktop's back end moves to CopilotKit Intelligence 0.17.0-rc.4.** The bundled CLI
+  moves to `copilotkit@3e64135`, so an install or update runs Intelligence 0.17.0-rc.4.
+
+### Kubernetes
+
+- **An admin can turn on managed updates from Admin.** Admin, Managed updates, Connect shows a
+  code to approve at CopilotKit's page, signed in with your OpenBot account as an admin of the
+  organization your licence names. Once it's approved, it shows one `helm install` of
+  the `openbot-agent` chart with nothing secret in it: the agent collects a one-time token from
+  OpenBot itself, and the screen then shows its last heartbeat and version. Only the admins of the
+  organization `default` see it, and only on a team install you run yourself.
+  - The `openbot` chart turns this on by default (`server.managementEnrollment.enabled`). Nothing is
+    connected or called until an admin clicks Connect. The server's internal status port is now on,
+    open only to the agent's own pod (`openbot-agent` in `openbot-system`) until the agent manages
+    the release. The server gets a projected token of its own service account and the cluster's CA,
+    and checks the agent's token against the cluster's own keys. No role is granted.
+  - With `networkPolicy.enabled`, also set `networkPolicy.kubernetesApiCidr`, so the server can read
+    the cluster's keys. To leave it off, set `server.managementEnrollment.enabled=false`.
+- **The management agent can connect without copying a secret.** With `enrollment.serverUrl` set to
+  OpenBot's internal status port and no install id, the agent proves itself to the OpenBot server
+  with a short-lived service account token, collects the one-time enrollment token the server holds
+  once an admin connected the install, makes its own key, trades a certificate request for its
+  certificate and writes both to its own Secret, which it reuses after a restart. `helm uninstall`
+  leaves that Secret behind, so after a disconnect and a new Connect the agent asks OpenBot at
+  start and, handed the new install's token, enrolls again and replaces the old certificate. The
+  key never leaves the cluster, and nothing secret is logged. Until you choose how the database is
+  backed up (`backup.kind`), the agent refuses every upgrade that changes the database, before
+  touching anything.
+
+### Bots and models
+
+- **Every harness OpenBot ships calls the model gateway with its run's own token, where the server
+  sends one.** One harness serves every organization of an OpenBot, and the key in its environment
+  names one organization. A run that brings its own token (`forwardedProps.openbotModelRoute`; on
+  Mastra the `OpenBot model route` context entry) calls the gateway with it, so the call is answered
+  on that run's organization's AI connection. CrewAI, LlamaIndex, Agno, LangChain, Google ADK,
+  Pydantic AI, Microsoft Agent Framework, Strands, AG2, Langroid, the Claude Agent SDK on a key and
+  Mastra all do. Only calls to the gateway carry it, and the token never reaches the model or a
+  framework's own state. A run that brings none keeps the environment's key, so OpenBot Desktop
+  behaves as before.
+- **A Claude plan's query is kept per organization on the LangGraph (TypeScript) engine.** The same
+  conversation id for a Bot of the same id in two organizations is two Claude queries now, not one
+  shared transcript. A run with no organization keeps the query name it always had.
+
+### Teach a Bot
+
+- **Recordings reach Learning on a self-hosted team install with `INTELLIGENCE_GATEWAY_PROXY` on**,
+  as `bun run stack` and the bundle run it when everything is on one machine or cluster. OpenBot
+  refused the connection a recording streams on, because the Recorder isn't signed in to OpenBot
+  the way a browser tab is. The recording stayed "sending" with no title and never reached
+  Learning. OpenBot now lets that connection through once, for the recording it just started,
+  while the Recorder is still connected. The personal edition was not affected.
+- **The Recorder says who refused a recording's connection.** The popup used to tell you to check
+  `CHECK_ORIGIN`, even where that setting can't be the cause. Now, when the connection goes through
+  OpenBot's own address, it says OpenBot refused it. Only when the connection goes to another
+  address does it name the `chrome-extension://` origin an admin must allow there.
+
+## 1.1.2
+
+**Before upgrading.** Nothing in a Helm values file, a Compose override or a script has to change,
+unless you rely on task threads.
+
+- **No migrations.** The database stays at `0137_ai_connections`, where 1.1.1 left it, so 1.1.1
+  upgrades to 1.1.2 with its servers rolling one by one, with no downtime, and goes back to 1.1.1
+  the same way. Upgrading from 1.1.0 or older runs 1.1.1's migrations as well: read 1.1.1's Before
+  upgrading first.
+- **Task threads are off unless you turn them on.** No Bot hands a person's request to a task
+  thread any more: every Bot does the work in the conversation, including one set to hand work to
+  agents. Set `OPENBOT_TASK_THREADS=on` on the server (also `true` or `1`) to bring them back as
+  they were. Nothing is removed: a Bot keeps what it is set to, and task cards and threads already
+  in conversations still show and can still be followed up or stopped.
+- **Deprecated:** nothing.
+
+### Bots and models
+
+- **Bots do the work in the conversation.** With task threads off (above), no Bot is offered a task
+  thread to hand work to, and a Bot set to hand work to agents runs on its default agent with its
+  apps, as a Bot that does the work itself does. With `OPENBOT_TASK_THREADS=on`, only a Bot set to
+  hand work to agents does so: since 1.1.0 every Bot, the General and Personal Assistants included,
+  handed requests in a person's own conversation to task threads even with Hand work to agents off.
+- **A Bot's Agents page has no Hand work to agents switch.** Every Bot shows the Runs on card, a Bot
+  set to hand work out included, with its default agent chosen. Saving the page keeps what the Bot
+  is set to, its model, effort, instructions and agents too, so turning task threads back on brings
+  it back as it was. A Bot's profile says what a Bot that does the work itself says, such as "Does
+  the work itself on OpenBot", and a conversation with such a Bot takes a model pick like any other.
+- **A Bot asks for the app a request needs instead of searching around it.** A Bot is told that what
+  is private to the person or their team in an app it has no tools for, such as the team's own
+  GitHub repositories, starts with that app's card, which connects it or asks an admin for it, and
+  not with the public web, which shows only what is public. A page of theirs that comes back not
+  found on the web and could be private, such as a private repository's 404, gets the same card
+  instead of "it may not exist", and so does the person saying something is private. Anything
+  public, such as an open-source project's release or a dead public link, is still answered from
+  the web, and a routine, which nobody is watching, says which app needs connecting instead of
+  showing a card.
+- **Whoever manages a Bot that runs at an address of its own can change its Agent URL on Setup.**
+  The row opens a dialog that checks the address's shape before saving it, and shows the server's
+  refusal under the field; saving the same address sends nothing. For anyone who can't manage the
+  Bot it stays read-only, and a built-in Bot is unchanged. Other Setup edits no longer send the
+  stored address, so a Bot saved at an address the deployment's rules have since closed can still
+  be renamed.
+- **A Bot asked to watch Slack says what works.** Without a Slack pairing, which the personal edition
+  never has, no Slack event reaches OpenBot. A Bot asked to act on Slack messages was sent to a
+  Reaching you page that edition does not show; it is now refused before anything else, and the Bot
+  runs the goal from a routine that checks the person's connected Slack app instead, with Slack's
+  connect card in the conversation when it is not connected. Where a pairing exists, the owner's
+  Slack account linked under Connections counts as well as a Reaching you binding: only the owner,
+  only channels that account is in, checked again on every event.
+
+### OpenBot Desktop
+
+- **Approved folders survive a server restart.** A restart of OpenBot's server, Restart in the Status
+  window among them, dropped every folder approved in Settings > Computer: Settings read "No folders
+  approved" and a Bot was told its folder access had ended. OpenBot Desktop now holds the folders
+  for up to two minutes while the server is away, ending only the work that was running, and hands
+  them back when it answers. The server takes back only the folders OpenBot Desktop held for it, and
+  never one revoked or stopped in the meantime. Stop and Quit still end them, as does a server that
+  stays away for more than two minutes.
+- **Install sets OpenBot up again over an earlier install whose engine is gone.** On Windows, with
+  Podman removed after an earlier install, Install took the old install as done and the window
+  stayed on "Setting up this computer" after sign-in. Install now always checks: it brings the
+  engine back first, and skips the download when the install is still whole.
+- **On Windows, setup no longer waits for ever on "Checking what OpenBot needs to download".** A
+  command OpenBot runs in its engine's machine now stops after 60 seconds. If Windows refused the
+  machine's key because other accounts can open it, setup says so and names the file and the
+  account.
+- **On Windows, the engine's disk goes in the install folder.** With the install folder on F:,
+  the engine's 40 GB disk goes on F: too, and the space check measures F:. A full C: no longer
+  stops the install. A drive that cannot hold the disk (a network share, a removable drive, exFAT)
+  keeps it on C:, and Install says so. An engine already on C: stays there. When C: is short and
+  F: has room, OpenBot offers **Move OpenBot's storage to F:**, which stops every WSL distro for
+  a moment, Docker Desktop included.
+- **On Windows with only the WSL that ships with Windows, setup offers the WSL update.** It stopped
+  on "could not check the WSL version", because that WSL does not know `wsl --version`. Setup now
+  shows the WSL update screen, whose fix runs `wsl --update`.
+- **Stop and Quit stop OpenBot's own Podman machine.** They left it running, so on Windows its WSL
+  distro kept holding memory after Stop or Quit. Both now stop it last, once everything of OpenBot's
+  in it has stopped, and never touch your own machines; Start brings it back. An update's stop
+  leaves it running for the restart that follows, and Quit shows the step on the Shutting down
+  screen.
+- **On Windows, uninstalling with "Delete the application data" deletes OpenBot's downloads too.**
+  The installers, tools and machine image OpenBot downloads (about 128 MB, in `~\OpenBot`) stayed
+  in the profile whichever folder OpenBot was installed in. They now go with the data, and the
+  folder with them once nothing is left in it. Without the data deleted, they stay, as the machine
+  does.
+
+### Kubernetes
+
+- **OpenBot can be kept up to date for you, if you ask.** The `openbot-agent` chart, published with
+  each release at `oci://ghcr.io/copilotkit/charts/openbot-agent`, installs a management agent into
+  `openbot-system`, beside an OpenBot install, with Flux's source and Helm controllers limited to
+  that namespace. Nothing is managed without it: the `openbot` and `openbot-bundle` charts never
+  reference it, and an install without it is unchanged. To opt in, CopilotKit gives you an install
+  id and a client certificate. Put the certificate in a Secret and your product values in another,
+  choose a weekly window of at least four hours (UTC) and how your database is backed up, and
+  `helm install` the chart.
+  - The agent only calls out: every minute, over HTTPS with that certificate, to
+    `https://fleet.bot.copilotkit.ai`. A heartbeat carries only the fields in
+    `shared/management-contract.ts`: the install id, versions and image digests, the last
+    migration, Flux's readiness, ready and wanted pods per workload, and the upgrade's state. A
+    metrics collector sends a fixed list of health metrics with nothing that names a person, an
+    organization or a tenant; `otel.enabled: false` turns it off.
+  - It upgrades only to a release the management service names, only inside both your window and
+    the service's, only along the release's upgrade paths, by pinning Flux to that release's exact
+    chart digest. It creates and keeps the product's Flux objects from the chart's settings, so
+    `helm install --wait` finishes under Helm 4. Before an upgrade that changes the database it
+    stops writes and takes a backup, and goes on only once the backup succeeds; it refuses the
+    upgrade when the backup it would take is of a different database from the one the install
+    uses. A failed backup puts the install back as it was, and the same release is not tried again
+    for 30 minutes. It never rolls back by itself: an upgrade that stops after the database may
+    have changed waits for a person.
+  - It runs five commands, each signed and short-lived: restart, rollback (only where the release
+    says the previous one runs on its database), pause, resume, and a support bundle that is
+    redacted and written to a volume in your cluster, never uploaded.
+  - It installs the product as `openbot-deployer`, an admin of the product namespace only, which
+    also holds the HTTPRoutes, ExternalSecrets and Sandboxes the product charts create there. It
+    turns on the server's internal status port for the release it manages, open to
+    `openbot-system`, and keeps your own `server.internalStatus.allowFrom` peers.
+  - Pause it with `helm upgrade openbot-agent ... --set paused=true`, which works under Helm 4 on an
+    install the agent has already upgraded. `helm uninstall openbot-agent` turns it off and leaves
+    OpenBot installed for a plain `helm upgrade`.
+  - Its image is the release's own, `ghcr.io/copilotkit/openbot-management-agent:v<release>`. The
+    chart published with 1.1.1 named a tag that was never published.
+- **`bun scripts/update.ts kubernetes apply` accepts a published release.** It compared the commit
+  the running server reports with the one the release names, which never match for a published
+  release, so an upgrade that had worked ended in recovery-required with "Running server release
+  identity does not match the candidate", and a release that stops writes for its upgrade was
+  scaled back to zero. It now checks the version, distribution, repository and channel, with the
+  image digest the server Deployment is pinned to, as before.
+
+### Smaller changes
+
+- The API refuses a notification route that names the same way of reaching a person twice, such as
+  `["push", "push"]`, with 400 `VALIDATION_ERROR`, and changes nothing, as the spec's unique lists
+  say. The web app never sends one.
+
+## 1.1.1
+
+**Before upgrading.** Read these first: several change what a Helm values file, a Compose override
+or a script has to say.
+
+- **The Helm charts refuse shared and external computers until you say you mean them.** Shared
+  computers (`computers.mode: shared`, still the default) and external ones
+  (`computers.mode: external`, the one computer at `computers.url`) run every person's Bots on one
+  computer, where a command one Bot runs can read another person's files, so they suit a proof of
+  concept only. Sandbox mode (`computers.mode: sandbox`) gives each person a computer of their own
+  and is the way to run OpenBot for people; it needs the agent-sandbox controller in the cluster.
+  A release on shared or external computers, including one that never set `computers.mode`, has to
+  set `computers.sharedModeAcknowledged: true` before upgrading
+  (`openbot.computers.sharedModeAcknowledged` in the `openbot-bundle` chart), or `helm install` and
+  `helm upgrade` stop with a message naming both choices and change nothing. That includes an
+  upgrade with `--reuse-values`, and the single-user mode of either chart. Acknowledged, the
+  install notes say it again, and admins see it in Admin (below).
+- **The `openbot-bundle` chart keeps files in its own object store.** A bundle upgraded with your
+  own values file moves every file people and Bots attached out of PostgreSQL and into the bucket
+  `openbot-files` in the bundled Intelligence's local object storage, which a new Job makes on
+  every install and upgrade. That storage is one pod, with no replication or backup of its own. To
+  keep files in PostgreSQL, set `openbot.attachments.store: postgres` and
+  `openbot.objectStorage.enabled: false`. An upgrade with `--reuse-values` keeps the values it had,
+  so files stay in PostgreSQL. Don't turn off `intelligence.localObjectStorage` while
+  `openbot.objectStorage` points at it: the bundle refuses that. See Files (below).
+- **Migrations run at start: five, all additive.** The database moves from `0132_bot_task_runs` to
+  the migration `release-policy.json` names for this release. `0133_files_in_an_object_store` adds
+  the `file_deletions` table and lets an attachment's bytes live outside PostgreSQL,
+  `0134_attachments_storage_key_index` indexes where they live, `0135_files_gate_opened` records
+  when files may move, `0136_api_deprecated_use` counts use of deprecated API, and
+  `0137_ai_connections` keeps the AI connection an admin chose (below). A 1.1.0
+  server works against the new schema, so 1.1.0 upgrades to 1.1.1 with its servers rolling one by
+  one, with no downtime. `0133` needs OpenBot's login to hold the `openbot_system` role's
+  privileges, as 1.1.0 set up, and stops with the `GRANT` to run when it doesn't. It waits at most
+  five seconds for a lock on `attachments`, so a long transaction can fail the first start, which
+  then tries again. Upgrading from 1.0.x or 0.3.x runs 1.1.0's migrations as well: read 1.1.0's
+  Before upgrading first.
+- **Going back to 1.1.0 after files moved to an object store** needs them moved back first: set
+  `attachments.store: postgres` with the store still configured, and wait for the move to finish.
+  A 1.1.0 server cannot read a file that is in the store.
+- **New Bots run on the LangGraph (TypeScript) engine where a deployment runs it.** OpenBot
+  Desktop runs it, and an installation's Bot that ran on the Python LangGraph engine moves to the
+  TypeScript one at its next Install and Start, keeping its conversations. Docker Compose now
+  defines `agent-langgraph-ts` (port 4215, on this machine only), which a plain `docker compose up`
+  builds from the checkout unless `LANGGRAPH_TS_IMAGE` and `IMAGE_PULL_POLICY=missing` name the
+  published image. A server without `LANGGRAPH_TS_AG_UI_URL`, and both Helm charts, keep new Bots
+  on the server's built-in engine. `scripts/start.sh` starts it on 4215 and sets
+  `LANGGRAPH_TS_AG_UI_URL` to it, except in the personal edition (`LANGGRAPH_TS_PORT` moves it).
+  `OPENBOT_DEFAULT_BOT_ENGINE=built-in` keeps every new Bot there.
+- **Compose: Claude and ChatGPT plans run in services of their own.** `agent-harness` is no longer
+  handed `CLAUDE_CODE_OAUTH_TOKEN`, `CHATGPT_AUTH_FILE` or the `./.langchain` folder. They go to
+  two new services, `agent-claude-plan` and `agent-chatgpt-plan`, behind the `claude-plan` and
+  `chatgpt-plan` profiles, which OpenBot Desktop starts when a plan needs them. A Compose override
+  of your own that ran a plan through `agent-harness` turns on the profile and sets
+  `CLAUDE_PLAN_HARNESS_URL` or `CHATGPT_PLAN_HARNESS_URL`. `agent-langgraph-agui` reads the ChatGPT
+  plan's `./.langchain` folder too, and `.env.example` points `CHATGPT_PLAN_HARNESS_URL` at it.
+- **The model picker offers only models proven on the Bot's engine** (below). A conversation or a
+  Bot set to a model that isn't proven runs on the default, and says so.
+- **A model gateway has to serve `/responses` for gpt-5.4 and gpt-5.5.** Bots behind an
+  OpenAI-compatible address now call those models, and their mini, nano and dated versions, on the
+  Responses API, because they refuse tools with a reasoning effort on Chat Completions.
+  `COPILOTKIT_OPENAI_API=chat` keeps them on Chat Completions, for the built-in Bots and the AG2
+  and Langroid harnesses.
+- **A server that refuses to start exits with code 78**, where it exited with 1. The all-in-one
+  image now ends its container instead of trying again forever, and on Kubernetes the pod's
+  CrashLoopBackOff names the reason in `kubectl describe`. A crash still exits with 1. Monitoring
+  that watches the exit code may need to know the new one.
+- **Settings that now stop a server from starting when they are wrong:** `OPENBOT_MINIMUM_CLIENTS`,
+  `OPENBOT_DEFAULT_BOT_ENGINE`, `SHUTDOWN_KEEP_SERVING_SECONDS`, `SHUTDOWN_DRAIN_SECONDS`,
+  `RELEASE_STATUS_PORT`, and the file store's (below). An `S3_BUCKET`, `GCS_BUCKET` or
+  `AZURE_STORAGE_CONTAINER` already in the server's environment, for example one it shares with
+  Intelligence, configures a file store even with `FILES_STORE` unset, and the server then checks
+  that store at start and refuses to start when it can't use it.
+- **Kubernetes: a server pod takes up to 45 seconds to stop**, so it can finish what it is doing
+  (below). `server.shutdown` sets it.
+- **The `openbot` chart needs this release's image.** Its wait for the database now runs from the
+  server's own image (below), so the new chart with an older `image.tag` doesn't start.
+- **Deprecated:** nothing.
+
+### Files
+
+- **Files can live in an object store.** Amazon S3 or anything that speaks its API, Google Cloud
+  Storage or Azure Blob Storage, where they were always in PostgreSQL. With a store, a file can be
+  up to 100 MB. Without one nothing changes: files stay in PostgreSQL, with 8 MB for pictures and
+  PDFs and 1 MB for other files, and OpenBot Desktop stays on PostgreSQL. The `openbot` chart gains
+  `attachments.store` (`postgres` unless set) and `objectStorage`: `enabled`, `provider` (`s3`,
+  `gcs` or `azure`), `bucket`, `prefix` (`openbot/`), `region`, `endpoint`, `forcePathStyle`,
+  `azure.accountUrl`, `deleteAfterDays` (7), `assumeAllServersCurrent`, `existingSecret` with its
+  `secretKeys`, and `inCluster` for a store in the cluster. A server pod can sign in to the store
+  with workload identity through `serviceAccount.annotations`. On Docker Compose the same settings
+  are `FILES_STORE`, `FILES_PREFIX`, `FILES_DELETE_AFTER_DAYS`, `FILES_ASSUME_ALL_SERVERS_CURRENT`,
+  `S3_*`, `GCS_BUCKET` and `AZURE_STORAGE_*` in `.env`. The chart refuses a store asked for and
+  not set up, a Secret without its keys, and a store in the cluster behind a network policy with no
+  way to reach it, each by name.
+  - The server writes, reads and deletes a test file at start, and refuses to start when the store
+    doesn't answer. It never falls back to PostgreSQL.
+  - Files already in PostgreSQL move to the store in the background, and back again when
+    `attachments.store` is set to `postgres` with the store still configured. A server refuses to
+    start without the store's settings while any file is still in it.
+  - During a rolling upgrade new files stay in PostgreSQL until no 1.1.0 server is connected. A
+    connection pooler, such as PgBouncer or RDS Proxy, hides which servers are connected: set
+    `assumeAllServersCurrent: true` once every server runs 1.1.1.
+  - A deleted file leaves the store after `deleteAfterDays`, and a weekly sweep removes anything
+    left behind. Files are served from OpenBot's own addresses, as before.
+- **Word, Excel and PowerPoint files.** People can attach `.docx`, `.xlsx` and `.pptx` files, and
+  Bots can send them, recognised by what is inside rather than by the name. The Bot reads their
+  text: a workbook's sheets as tables, a document with its tables, a presentation's slides in
+  order, up to 120,000 characters. They count as documents, so the document limit applies. Old
+  `.doc`, `.xls` and `.ppt` files, password-protected ones, macro-enabled ones (`.docm`, `.xlsm`,
+  `.pptm`), templates, and a file whose contents don't match its name are refused with a sentence
+  saying why.
+- **Bots send files to people.** A Bot can hand you a file from its computer. It shows as a card in
+  the conversation, a task or a group, with Download, and is still there after a reload. A link to
+  the file in the Bot's words downloads it, where it opened the home page.
+- **The limits come from the server.** The message box refuses a file over this OpenBot's limit
+  before uploading it, and a picture over 8 MB shows as a file. A picture over the model's own limit
+  reaches the Bot as a note instead of failing the turn.
+
+### Apps and the OpenBot they talk to
+
+- **Every app says which version it is, and OpenBot can ask for a newer one.** The web app, OpenBot
+  Desktop, the phone app and the Recorder send `OpenBot-Client: <app>/<version>` on every request,
+  and the server's `deployment` answer names the API versions it serves and the oldest release of
+  each app it serves (`api`, `minimumClients`, `launcherApi`, `extensionApi`). An app older than
+  that reads "Update OpenBot" in place of the app, and a server too old for the app says "Ask
+  whoever runs your OpenBot to update it". A server refuses an older app's requests with 400
+  `CLIENT_UPDATE_REQUIRED`. Nothing is refused unless an admin sets `OPENBOT_MINIMUM_CLIENTS`
+  (for example `desktop=1.2.0,mobile=1.2.0`), because a release serves every app released in the
+  12 months before it. A request with no `OpenBot-Client` header, such as a script's, is never
+  refused.
+- **OpenBot Desktop 1.0.3 or older gets a page instead of a server that stops.** An older Desktop
+  that starts this release now shows "Update OpenBot" with Check for Updates…, where the server
+  used to exit for want of the install token those apps never wrote.
+- **OpenBot Desktop checks it can start a release before it starts it.** A release that needs a
+  newer app is not started; the window offers Update and restart instead.
+- **A signed security floor.** The apps, and OpenBot Cloud's servers, can be told the lowest safe
+  release of OpenBot Desktop, its back end, the phone app and the Recorder; an app below it shows
+  one notice, "This version of OpenBot has a security problem. Update to keep using it." It never
+  applies to a company's own OpenBot, and no floor is set
+  ([docs/releasing.md](docs/releasing.md#security-floor)).
+
+### API
+
+- **The API refuses NUL in text.** Every text field the spec holds to a pattern refuses a NUL
+  character anywhere in it, with 400 `VALIDATION_ERROR` and "That text has a character OpenBot
+  can't keep. Type it again." Before, one NUL could pass where the pattern asked for a character.
+- **The API says when something you call is deprecated.** An operation, a query or header
+  parameter, or a request-body field the spec marks deprecated answers with the standard
+  `Deprecation` and `Sunset` headers and a `Link` to this changelog, whose Deprecated list under
+  "Before upgrading" says what replaces it. It keeps working until at least its sunset, 12 months
+  or more after it was deprecated. Nothing is deprecated yet, so no answer carries them. See
+  [api/README.md](api/README.md#deprecating).
+- **Statuses, roles and scope kinds in API answers can gain values.** The spec declares them open
+  (`x-extensible-enum`): a task's or a run's status, a person's role, a network policy's scope,
+  what decided a person's permission, and the others listed in `api/accepted-breaking-changes.md`.
+  A script that reads one should treat a value it doesn't know as "other" rather than fail, as the
+  web and phone apps now do. The values sent today are unchanged.
+- **Edit a routine in place.** `PATCH` on a routine changes its name, what to do, its schedule and
+  its time zone, keeping its conversation and runs, and a routine's page has an Edit routine row.
+  Before, the only way to change one was to ask its Bot. A routine in an answer now always carries
+  its `cron`.
+- New optional fields: `computerMode` in the organization settings' `context`, `attachmentLimits`
+  and `securityMinimumClients` on `deployment`, `files` and `declined` on a message, and `unverified` on a conversation's model
+  choice. A Bot's `framework` can be `langgraph-ts`.
+
+### Bots and models
+
+- **Change the AI connection with no restart.** An admin of a personal OpenBot changes the AI
+  connection from Settings > General > AI model: a key, an address, or, in OpenBot Desktop, a plan
+  or provider sign-in. OpenBot checks it with the provider before saving it, and the next run uses
+  it. A team's OpenBot keeps it as its deployment sets it: Settings doesn't offer it, and `PUT`
+  answers 409 `AI_CONNECTION_FIXED`.
+  `GET` and `PUT /api/v2/organizations/{organizationId}/ai-connection` do the same, and with
+  `MODEL_GATEWAY_TOKEN` set the Bots' engines reach models through OpenBot instead of holding a
+  provider key of their own.
+- **The model picker offers a model only when OpenBot has proven it on the Bot's engine.** A daily
+  check sends every listed model a request through each engine, and a model that doesn't answer
+  there is hidden, on OpenAI, Anthropic and Google. A conversation already set to one runs on the
+  default, and the composer says "X doesn't work with this Bot yet, so this conversation uses Y".
+  A provider never checked, such as xAI, and a gateway, list everything as before.
+- **New Bots on LangGraph (TypeScript).** See Before upgrading. A Bot's Setup > Connection says
+  what it runs on.
+- **Claude plan errors say what happened.** A usage limit, running out of credit, a dropped
+  connection, no answer, a client too old for the model and a refusal each get their own sentence,
+  and a task tries again after a dropped connection but not after a limit. A call to a tool the
+  step didn't offer goes back to the model as a tool error instead of ending the turn, and a reply
+  that came back cut off says "Ask it to carry on". The Claude harness bundles a newer Claude Code,
+  so plan Bots run Claude's newest models.
+- **Gemini sign-in says what Google said**, with when to try again. A free-tier daily limit reads as
+  a rate limit, never as out of credit, and the model list loads when OpenBot starts.
+- **A failed turn that had already done something keeps its message sent.** On every engine, when
+  the Bot had said something or called a tool, the message stays sent and the failure shows under
+  the turn, instead of coming back in the message box to run again from the start. A turn that
+  never got going still gives the words back.
+- **OpenBot reaches a Bot you run yourself, a plan's engine and MCP servers on a connection of its
+  own**, so a second message a few seconds after the first no longer fails with "Couldn't reach"
+  the Bot. A built-in
+  Bot's tool calls are no longer lost under load.
+- The AG2, Langroid and LangGraph harnesses call gpt-5.4 and newer, and the -pro and -codex
+  models, on the Responses API; `COPILOTKIT_OPENAI_API=responses` or `chat` chooses one for every
+  model in AG2 and Langroid.
+  The Agno harness no longer sends Claude a `top_p`, which Claude 4.5 and 4.6 refused. The
+  LangGraph harness keeps the kind of error Gemini and xAI name, and pins its model clients.
+
+### Conversations
+
+- **Group conversations name who sent each line**, by name or email, and "Someone who left" for
+  someone no longer there.
+- **A Bot's reply waiting to be shared says whose turn it is.** In a group, only the Bot's owner sees
+  Open on it; everyone else reads "Waiting for <owner> to allow sharing this reply." A reply the
+  owner declined to share reads "<owner> didn't share this reply. Nothing was sent." as a notice,
+  not an error.
+- **A Bot with nothing to say in a group stays quiet.** A message that names no Bot goes to every
+  Bot in the group, and one that finds it isn't theirs to answer now leaves no line, where everyone
+  saw "The turn finished without saying anything." in red under it. A retry doesn't run it again. A
+  Bot that was addressed (a chip, an `@` and its name, a handoff, an answer to its question) and says nothing
+  still fails, as in a one-to-one conversation.
+- **Dictation in OpenBot Desktop** on a Mac falls back to the next language and region the Mac has
+  when the page's isn't available, and says which to add. A browser says when it can't take
+  dictation in a language.
+
+### Admin
+
+- **Admins see when everyone's Bots share one computer.** On a team's OpenBot whose Bots all run on
+  one computer, Admin's overview and its Computers page say so, say it suits a proof of concept
+  only, and say how to give each person a computer of their own. An OpenBot one person uses, OpenBot
+  Desktop included, says nothing, because that computer is the person's own. Nobody but an admin
+  sees anything new. The organization settings' read-only `context` gains `computerMode`
+  (`per-person`, `shared` or `none`).
+
+### Personal edition
+
+- **OpenBot for one person asks once to be starred on GitHub.** In the personal edition only, once
+  you have used OpenBot on three separate days, a card above the message box asks you to star
+  OpenBot on GitHub, right after something goes well: you copy a Bot's answer, one of your
+  routines finishes a run, or a long task finishes. Never right after an error, never on a team's
+  OpenBot, and never beside the notifications offer. Either answer is saved to your account, so it
+  is never asked again on any device. Settings > General keeps the link in a new OpenBot section.
+  The preferences gain `dismissedNotices` (the notices you answered) and `noticesDue` (the ones
+  OpenBot would show you now), and `POST /api/v2/organizations/{organizationId}/nudge-events`
+  counts how many people were shown a nudge, followed it or dismissed it, with product telemetry
+  on; see [TELEMETRY.md](docs/TELEMETRY.md).
+
+### OpenBot Desktop
+
+- **Connected to another OpenBot on a Mac works again.** In 1.1.0 the window showed only "This
+  relay is for the OpenBot window", because the Mac's web view held back the sign-in cookie after a
+  redirect.
+- **A server that refuses to start says why at once**, in its own words, where the window waited
+  three minutes and said it could not finish starting. Retry after fixing it starts clean, without
+  the old refusal.
+- **Retry waits for a back end whose services are still coming up.** When the server had stopped
+  and some of the back end's services were still starting, Retry gave up on its first look and
+  said OpenBot was running but not working properly. It now waits for them as it waits for a back
+  end that is starting, and says that only if they are still not ready at the time limit.
+- **Stop and Quit let the server finish first.** The server stops before the Bots and computers it
+  is using, and a Bot's answer in progress ends as stopped, not as "Couldn't reach". Stop and Quit
+  no longer cut each other's stop of the back end short, so Quit during a Stop on Windows no longer
+  leaves it running. Stopping can take a few seconds longer.
+- **An update checks this computer has room first**, before it stops or downloads anything, and
+  says "OpenBot needs more free space to update" with the figures and Retry. A full disk reads as
+  one plain line.
+- **Status window:** Restart applies changes made to `.env`, it offers Start after Stop, and it
+  shows Updating with no buttons during an update.
+- **Launching OpenBot while it quits** opens it again once it has quit, where it stayed on Shutting
+  down.
+- **The first Start after Install** waits up to two minutes for the container engine, instead of
+  sending you back to Install.
+- On Windows, checking your saved setup no longer freezes the window while Windows finishes an
+  update, and says so after five seconds.
+- An update stopped after it updated your data says it didn't finish and that the next Start
+  finishes it. An update to the release OpenBot already runs is not a failure.
+- The first screen offers OpenBot (Self-Contained), and one OpenBot for Business card, Cloud or
+  Self-Hosted, that books a call; connecting to an OpenBot at work is "Already have OpenBot at
+  work? Connect to it." The update screen says the same.
+- The step before a Composio sign-in shows inside the Desktop window.
+- Get Troubleshooting Logs adds the speech log and the model provider's own error words, with
+  secrets taken out.
+
+### Running OpenBot
+
+- **A server asked to stop finishes what it is doing.** It finishes requests and Bot answers in
+  flight, closes live connections with 1001, and keeps an answer still running at the limit as
+  stopped. `SHUTDOWN_KEEP_SERVING_SECONDS` (0 unless set) and `SHUTDOWN_DRAIN_SECONDS` (6) set how
+  long; the chart's `server.shutdown` uses 5 and 25, and a pod's `terminationGracePeriodSeconds`
+  becomes their sum plus 15. A second signal stops it at once.
+- **A browser or database switched off in the OpenBot image stays off**
+  (`EMBEDDED_COMPUTER=off`, `EMBEDDED_POSTGRES=off`, as the charts' server pods set unless
+  `server.embeddedComputer` is on), where it was
+  restarted about once a second. A computer that exits no longer leaves its virtual display
+  running.
+- **The `openbot-bundle` chart installs on Amazon RDS and other managed PostgreSQL.** There only the
+  provider's extension role (`rds_superuser`, `cloudsqlsuperuser`, `alloydbsuperuser` or
+  `azure_pg_admin`) can create pgvector, so on a database server of your own the bundle's setup Job
+  gives OpenBot's role that extension role only while its migrations run on an empty database, and
+  takes it back once they are done. The Job now also runs after each install and upgrade to do that;
+  with `helm install --wait` it is the run straight after the install. A new
+  `externalDatabase.intelligenceParameters` gives Intelligence connection parameters of its own,
+  where its driver reads `parameters` differently from OpenBot's: on RDS, Intelligence needs
+  `sslmode=verify-full&sslrootcert=/etc/cpki/rds-ca/global-bundle.pem`, and its images carry RDS's
+  certificate bundle. Unset, it takes `parameters` as before.
+- **A database certificate checked against a CA of your own works at start.** With
+  `sslmode=verify-full&sslrootcert=<path>`, as Cloud SQL and Azure Database need, the server's
+  migrations now check the same CA its connections do, where they failed with "self signed
+  certificate in certificate chain" and the server never started. In the `openbot-bundle` chart,
+  `setup.extraVolumes` and `setup.extraVolumeMounts` mount that CA for the setup Job, and on Azure
+  Database the Job lends Intelligence's role `azure_pg_admin` until its pgvector migration has run,
+  then takes it back. With `global.storageClass` set, the bundle makes the claim for Intelligence's
+  object store with that class, so a cluster with no default StorageClass, such as a new GKE
+  Autopilot cluster, installs.
+- **The `openbot` chart's server waits for its database with nothing downloaded.** The init
+  container that holds the server until the database answers now runs `openbot wait-for-database`
+  from the image, with the server's own database client and TLS settings, and gets
+  `config.extraVolumeMounts` as the server does. In 1.1.0 it fetched a PostgreSQL client from the
+  npm registry in every pod, so on a cluster with no way out to the internet the server never
+  started. It needs this release's image: the chart with an older `image.tag` doesn't start.
+- **`helm install --wait` and `helm upgrade --wait` finish under Helm 4 and Flux.** The charts'
+  Jobs are no longer deleted on a timer after they finish, which Helm 4 read as never ready,
+  marking the release failed on a slow cluster. Each stays until the next upgrade replaces it.
+- **Signed charts in a registry.** Every release publishes the `openbot` and `openbot-bundle`
+  charts as signed OCI Helm charts, `oci://ghcr.io/copilotkit/charts/openbot` and
+  `oci://ghcr.io/copilotkit/charts/openbot-bundle`, at the release's version, signed with the key
+  in `docs/cosign.pub`. The release's `openbot-release.json` names each digest. Check one with
+  `cosign verify` and install it by digest with no checkout, or let a Flux `OCIRepository` verify
+  it.
+- **Release and health from inside the cluster.** `/release` now names the database's newest
+  migration. `RELEASE_STATUS_PORT` adds a second port that answers only `/release` and `/metrics`
+  (requests, errors and latency per route, and whether the database answers), so a collector needs
+  no `pods/exec` on the server. In the `openbot` chart, `server.internalStatus` (`enabled`, `port`
+  9464, `allowFrom`) puts it on a ClusterIP Service of its own, `<release>-server-internal`,
+  behind a NetworkPolicy that admits only those peers. A `RELEASE_STATUS_PORT` that isn't a port
+  number, or is the API's own port, stops the server from starting.
+
+### Smaller changes
+
+- An admin's review list shows a person as soon as their own space is made, and a denied folder
+  action lands in Activity after the attempt it denied.
+- Mastra's mark is its current one.
+- The OpenBot image reports the release it is. A release candidate's image said the release before
+  it, so its pages sent `OpenBot-Client: web/<previous>` and an `OPENBOT_MINIMUM_CLIENTS` naming
+  this release refused its own web app. `openbot release` prints it.
+- A step a rule refused, or one that failed, shows its whole reason, wrapped, where it was cut off.
+
+## 1.1.0
+
+**Before upgrading.** Read these first: several of them change what a script, a proxy, a Compose
+override or a Helm values file has to say.
+
+- **Migrations run at start and do not go back.** The database moves on from
+  `0088_approval_reviewer_guidance` to the migration `release-policy.json` names for this release,
+  through the migrations that hold organizations, teams, agents and task runs. Among them,
+  `0089_goal_ends_when_met` adds `ends_when_met` to `responsibilities` (false on every existing
+  goal, so existing goals behave as before), `0090_routine_goal_linked_by_run` adds
+  `goal_linked_by_run` to `routines`, and `0091_remote_mcp_oauth` adds `oauth` to `mcp_servers`.
+  Because every existing routine starts with `goal_linked_by_run` false, a routine that already
+  records a goal is read as made for that goal, including a broad routine that 1.0.x linked to a
+  goal because one of its firings ran it: completing that goal now switches the routine off, and
+  deleting the goal deletes it. Fourteen tables' rows move into new tables; the old tables are left
+  in place and no longer written. Restore the backup taken before the upgrade to go back.
+- **PostgreSQL needs two roles.** The migrations create two database roles that cannot sign in,
+  `openbot_app` and `openbot_system`, grant them to OpenBot's login, and from then on OpenBot runs
+  its queries as them, so PostgreSQL itself keeps organizations apart. OpenBot's login has to be
+  allowed to create roles, or an administrator creates the two first; otherwise the migration
+  stops with the SQL to run and changes nothing. Neither role may be a superuser or bypass
+  row-level security. The server checks at start, and every few minutes, that its queries run as
+  these roles and stops if they don't, so a connection pooler in front of PostgreSQL has to pass on
+  the `role` start-up parameter. Compose and the `openbot-bundle` chart set this up themselves.
+- **The earlier `/api/...` addresses are retired.** Every client of OpenBot's server now uses the
+  one API under `/api/v2/` (below), and every earlier address the server doesn't keep answers 404.
+  A script, integration or socket client that calls one has to move to the `/api/v2` address
+  `api/openapi.yaml` or `api/asyncapi.yaml` lists. A reverse proxy or firewall that allows
+  OpenBot's paths one by one has to allow `/api/v2/`, with WebSocket upgrades, and keep allowing
+  the addresses listed under What stays outside `/api/v2` (below). The API now refuses, with a 400,
+  a query parameter sent more than once where the spec takes one value, and a body that isn't valid
+  JSON on the operations whose body is optional, as the spec says. Check-in usage refuses an empty
+  `days=`, which it used to read as 7.
+- **The personal edition admits only requests that carry its install token.** A script or tool
+  that reached a personal OpenBot with no credentials is refused: give it an API key from
+  Settings > API keys, or send the token in `X-OpenBot-Install-Token`. A single-user OpenBot in a
+  container doesn't start without `OPENBOT_INSTALL_TOKEN`. OpenBot Desktop, `scripts/start.sh` and
+  both charts' single-user mode make one (below).
+- **The OpenBot images are checked with OpenBot's own key.** They are signed with the key in
+  `docs/cosign.pub` (`docs/deployment.md`), and no longer carry a GitHub build attestation or a
+  `sha-<commit>` tag. Deploy a version tag, or its digest from `container-images.json`.
+- **Everything already in OpenBot lands in its first organization**, still addressed as `default`.
+  Everybody is a member of it and admins are its admins. Nobody is signed out and no page address
+  changes. Rules written for a directory group (permission switches, network policies, Bots
+  published or pinned to a group, and shared app accounts' audiences) now name a team in that
+  organization with the group's name and people, and the API answers them with `scopeKind`
+  `team`. Names that differed only in case get a number, such as "Sales (2)". An OpenBot keeps one
+  organization until `OPENBOT_MULTIPLE_ORGANIZATIONS` is set (below).
+- **Kubernetes: the `openbot` chart no longer installs Intelligence.** A release on the 0.2 chart
+  that runs the Intelligence the chart installed is refused at upgrade, and nothing in the cluster
+  changes (below).
+- **Compose: services and settings are gone.** SPIRE (`spire-init`, `spire-server`,
+  `spire-agent`), the `agent-bot` and TypeScript `agent-langgraph` Bots, `BOT_PORT`, `BOT_IMAGE`,
+  `AGENT_BOT_MODEL` and `WORKER_SHARED_SECRET` are gone, and nothing starts the `migrate` or
+  `worker` service. A Compose override or script that names any of them has to drop it (below).
+- **Running from a checkout pulls the published images.** `bash scripts/start.sh` no longer runs
+  the server from the checkout, and the repository no longer builds OpenBot's images or holds the
+  Helm chart (below).
+- **OpenBot Desktop's back end moves to CopilotKit Intelligence 0.16.0-rc.13**, with the bundled
+  CLI at `copilotkit@7334f7d` (below).
+- **Settings and Admin are grouped differently** and several pages have new names (below). Old
+  addresses and bookmarks open the new pages.
+- **Everybody's theme starts on System.** A light or dark the app saved before is cleared, so
+  somebody who wants OpenBot dark whatever the system says picks Dark again (below).
+
+### Organizations and teams
+
+- **One OpenBot can hold many organizations.** Set `OPENBOT_MULTIPLE_ORGANIZATIONS=true` on the
+  server. Then everybody gets an organization of their own when their account is made, or at their
+  next sign-in if they were here before; anybody signed in can create another; and people join an
+  organization by invitation, where before everybody who signed in joined the one there was. Left
+  unset, OpenBot keeps the one organization it has, as before. The personal edition always has
+  one.
+- **Each organization is its own.** It keeps its own Bots (a new one starts with its own copies of
+  the starter Bots), conversations, apps and connections, Vault, skills, routines, approvals,
+  settings, permissions, network policies, Activity, model usage, computers, memory and Learning.
+  Its owners and admins run it, and to somebody outside it, it isn't there. Require SSO covers the
+  whole OpenBot, so it is set in the first organization only; the admins named in
+  `INITIAL_ADMIN_EMAILS` are admins of the first organization; and a Slack or Teams account, or a
+  phone number, connects in one organization at a time.
+- **Switch from the account menu.** It lists your organizations, your own marked, with
+  Organization settings, Invitations and New organization where you may create one. Choosing one
+  opens its home, and another open window follows when you come back to it. In the OpenDots,
+  OpenDuet and OpenFuse skins, use Settings > Organization.
+- **Owners, admins and members.** Whoever creates an organization owns it, only an owner makes
+  others owners, and an organization always keeps an owner. Settings > Organization renames it
+  (its id and slug stay) and lists its members, with their roles, Leave and Remove.
+- **Invitations.** An owner or admin invites an email address as an admin or a member. The person
+  needs no account yet, and the invitation lasts 7 days. OpenBot emails it when `SMTP_HOST` and
+  `MAIL_FROM` are set, and otherwise Invite gives a link to pass on. The invited person sees
+  Invitations in the account menu, with Accept and Decline, and the link works signed out and
+  lands on the invitation after sign-in. With `SMTP_HOST` set, the server won't start without
+  `MAIL_FROM`, with an invalid `SMTP_PORT` or `SMTP_SECURE`, or with only one of `SMTP_USER` and
+  `SMTP_PASSWORD`; `SMTP_PORT` is 587 unless set, or 465 with `SMTP_SECURE=true`.
+- **Removing somebody, with many organizations on, takes them out of that organization only.**
+  They keep their account, API keys and other organizations, and Restore brings back their role
+  and teams. Directory deprovisioning does the same. With one organization it works as before.
+- **Teams.** Teams open from the menu under your name and from Admin > Organization. Owners and
+  admins create, nest and delete them, a team's maintainers rename it and manage its people, and
+  anybody can leave one. A team under another gets what its parent was given. Publish a Bot to
+  teams or pin it for one, give an app or a skill to teams from its Admin page, set permissions and
+  network rules per team, and name a team in a shared account's audience. Bot sharing no longer
+  takes a new directory-group name.
+- **Directory groups are teams.** With SCIM, each group in your company's directory is a team,
+  marked as from the directory and kept in step with it. Its name and people can't be edited in
+  OpenBot.
+- **Every organization uses the deployment's one Intelligence project and key.** Creating an
+  organization makes nothing in Intelligence.
+
+### The model allowlist holds every run, and every run is metered
+
+- **Only allowed models applies wherever OpenBot picks the model.** With it on, OpenBot refuses a
+  run before it starts on a built-in Bot, on a Bot on the harness picked at setup, on a Bot that
+  hands work to agents (judged on its own model), and on a task or routine run on one of OpenBot's
+  own agents (judged on that agent's model, unless you picked one in that conversation). That
+  holds in the browser and in every turn that runs without it: routines, Run now, goals,
+  check-ins, follow-ups, tasks, Slack, Teams, text messages, group conversations and hand-offs
+  between Bots. A Bot at its own address that picks its own model still runs, and is recorded
+  against the list, as before.
+- **A refused run says why.** A conversation shows the admin's sentence ("This Bot uses
+  provider/model, which isn't an allowed model. Ask an admin to allow it."), where it could read
+  as OpenBot failing to reach its backend. A task refused this way reads Couldn't finish and isn't
+  tried again. A group message every addressed Bot refuses is turned away with the reason and
+  nothing is kept; when only some refuse, the rest answer and each refused Bot's line says why.
+- **Admin > Providers > Usage counts every run that reached a model**, background turns included,
+  each in its own organization, where it counted browser runs and check-ins. A run on the harness
+  picked at setup names the model OpenBot chose, where it was listed as unknown.
+
+### One API
+
+- **OpenBot has one API, described in `api/`.** `api/openapi.yaml` (OpenAPI 3.1) is the REST API
+  and `api/asyncapi.yaml` (AsyncAPI 3.1) is every WebSocket channel. Every resource is under
+  `/api/v2/organizations/{organizationId}/`, by an organization's id or its slug, and the first
+  organization is `default`; your own organizations and invitations are at
+  `/api/v2/people/me/organizations` and `/api/v2/people/me/invitations`. Errors are problem details
+  (`application/problem+json`) with a stable `code`, lists page with `cursor` and `limit`, and
+  every write takes an `Idempotency-Key` header. CI lints both files and fails a change that would
+  break a client of the spec.
+- **Every client is on it.** The web app, and with it OpenBot Desktop's window, the phone app and
+  the OpenBot Recorder call the API through clients generated from the spec, for every area:
+  Bots, conversations and tasks, routines, approvals, apps and connections, computers and
+  browsers, Learning and memory, Vault, notifications, admin settings, organizations and agents.
+  A test fails any new call to the server written by hand outside those clients.
+- **What stays outside `/api/v2`.** Sign-in, SSO and SCIM (`/api/auth`), and the addresses a
+  sign-in comes back to (`/api/plugins/oauth/callback`, `/api/plugins/arcade/verify`,
+  `/api/identity/github/callback`); the chat runtime (`/api/copilotkit`) and the Intelligence
+  gateway's client socket when OpenBot's server carries it (`/api/intelligence/client/websocket`);
+  webhooks (`/api/events`, and `/api/delivery/webhooks` for text messages and OpenTag); what a
+  Bot's harness and Intelligence call back on (`/api/agent-tools`, `/api/model-provider`,
+  `/api/learning-model`); an outside app calling a tool as the signed-in person
+  (`/api/plugins/call`); product events from earlier apps (`/api/telemetry`); a file's bytes
+  (`GET` and `HEAD` of `/api/attachments/{id}`); the addresses OpenBot Desktop and the released
+  1.0.2 and 1.0.3 shells call (`/api/desktop`, `/api/host-access/desktop`, `/api/capabilities`,
+  `/api/me`, `/api/recorder/connect-codes`); and `/health`, `/release` and `/.well-known`. The
+  earlier sockets at `/api/channels/events`, `/api/computers/{botId}/stream` and
+  `/api/computers/{botId}/terminal` are gone, and every other earlier address answers 404.
+- **Watching a run takes a join token.** A client asks
+  `POST .../conversations/{conversationId}/join-tokens` for a token that works once, for about half
+  a minute, with the address and topic to join.
+- **API keys and OAuth, for anything that is not the web app.** A signed-in person can make API
+  keys (`obk_...`, sent as `Authorization: Bearer` or `x-api-key`). A key acts as that person in
+  every organization they belong to, on `/api/v2` and on the socket a run streams on. Apps sign
+  people in with OAuth 2.1 and PKCE: access tokens last an hour and work on `/api/v2` and the few
+  addresses outside it the spec names, and refresh tokens rotate on every use. An app names its
+  organization with the `OpenBot-Organization` header (id or slug) at those addresses, and works
+  in the person's own organization without it. Each key may make 600 requests a minute, and past
+  that gets a `429` problem with `Retry-After`. Neither a key nor an app can list, make or revoke
+  API keys or sessions: that takes a signed-in session. An app's token needs `computers:write` to
+  type or click on a Bot's screen or terminal, and with `computers:read` it only watches. With one
+  organization, removing somebody deletes their keys and their apps' sign-ins. OpenBot on one
+  computer for one person has no OAuth, and has API keys of its own (Personal edition, below).
+- **The API holds requests to the spec.** A request body with a property the spec doesn't name is
+  refused with 400, at any depth, and so is text the database can't store, such as a NUL
+  character, where several addresses answered 500. Roles are `owner`, `admin` and `member`. Every
+  answer carries `Cache-Control: private, no-store` and `X-Request-Id`. An `Idempotency-Key`
+  replays its first answer for 24 hours, except one that held a password, a code, a token or what
+  was on a Bot's computer, which is answered `ANSWER_NOT_KEPT`. A query parameter sent more than
+  once where the spec takes one value is refused with 400, where the first value was kept, and so
+  is a body that isn't valid JSON on the operations whose body is optional (approving an app access
+  request, replacing a Bot's grant, replacing a goal trigger's secret), where it was read as no body.
+- **Settings has an API keys page.** Under You, a signed-in person lists their keys, creates one
+  by name and revokes one. A new key is shown once, with Copy. OpenBot on one computer for one
+  person has the page too, for its one person (Personal edition, below), and OpenBot Desktop
+  connected to an OpenBot elsewhere opens the page in your browser.
+
+### A Bot hands work to tasks and agents
+
+- **A Bot can hand a piece of work to a task and keep the conversation short.** It says in a line
+  what it will do, and a task card follows in the conversation. The card shows Working, Needs you,
+  Done, Couldn't finish or Stopped, how long the task has worked and when it last did something,
+  and Open thread. When the task finishes, its result is posted in the conversation whole, with
+  any chart, table or card it drew. A task waiting on you says so in one line with a link to its
+  thread, and the thread opens with "Sent from" the conversation that asked, as a link back. Bots
+  are told to hand off only work the person asked for.
+- **Stop a task, or steer it.** A working or waiting task has Stop on its card, on its row on the
+  Bot's Activity page and on the Needs you board. Steps it already finished stay done, and it reads
+  Stopped, not as a failure. Type into a task's thread to change the work, and the card in the
+  conversation that started it shows "You told it: ..." under it, and the Bot there reads what you
+  told the task on its next turn. A turn you run in a task's thread marks it Working, and its
+  answer is posted in the conversation that asked. Ask the Bot to add to a task or stop one, and
+  its answer is drawn as that task's card; when your words fit no task or several, it asks which.
+  A stopped task is never tried again, and the conversation that asked is told how many steps had
+  finished.
+- **Agents.** A new Agents page in the main menu lists the agents Bots hand work to: one that runs
+  in OpenBot on a model you choose, or a custom agent at an address, private to you or shared with
+  the organization by an admin. A Bot's Agents page has a **Hand work to agents**
+  switch. On, the Bot hands work to an ordered list of agents, the first being its default, with a
+  model of its own and optional instructions for how it hands out work. Off, it works as before,
+  and every existing Bot starts off. A task's card and thread name the agent doing it.
+- **See what a task did.** In a task's thread, each turn's steps fold into one row, "Worked for
+  52s", which opens to every step; the time counts the turn's own run, not time spent waiting on
+  you. Anything waiting for your approval stays in view. A Task details pane beside the thread shows
+  who ran it and on which model, its outputs, sources and the computer it used.
+- **Finished tasks leave Needs you.** A task a Bot handed off that has finished drops off the Needs
+  you board, since its result is already in the conversation. A Bot's Activity page groups its
+  work by where it stands (Needs you, Working, Scheduled, Done, Stopped, Failed, Recurring), hides
+  empty groups, and lists the task threads it opened with a link to the conversation that asked.
+- **A task's card keeps up.** It re-reads its task when the conversation's work changes, so a task
+  that carried on after Done no longer stays Done until a reload, and an open card no longer falls
+  seconds behind while several conversations work. A task waiting to try again after a passing
+  failure says until when. A task thread picks up a turn OpenBot's server continued in it, with
+  any approval that turn stopped on. A step cut off mid-run reads "interrupted".
+- **Shorter reports of finished work.** A Bot that finishes a job, itself or in a task, is told to
+  say what it did, with the link, in a few sentences and no list, then at most one sentence on
+  what to check, and to call anything it inferred rather than read unconfirmed.
+- **"The last day" means the last 24 hours** when a Bot hands work to a task. Bots are told to give
+  a time window counted back from now, never "since" yesterday's date.
+- **A task tries again only when it could help.** A failed turn is sorted first. A passing failure
+  (a rate limit, a provider or app outage, a timeout, a restart) is tried again after a wait, the
+  one the provider asked for when it named one, up to three runs. A lasting one (a refused key,
+  sign-in or permission, an admin's rule, your no) is not tried again. A built-in Bot sends each
+  model request once under a task's turn; Bots on the LangChain and Claude Agent SDK harnesses keep
+  their own retries. A task that gives up says what was and wasn't done.
+- **A task makes an app change once.** A change is recorded before it is sent, so a task retried,
+  timed out, picked up after your answer or after a restart doesn't send it again. A change whose
+  outcome is unknown isn't sent again without checking the app, and a task that couldn't finish
+  names the changes it sent but couldn't confirm.
+- **A task that needs you waits for you.** Asked to take over the Bot's browser, type a secret or
+  sign in, a task reads Needs you, and carries on once you answer. Waiting for an app, Request
+  access keeps it Working while an admin decides: a dismissed request reads Couldn't finish, a
+  withdrawn one Needs you, and once the app is given the task carries on by itself.
+- **Task results arrive in order, and find you when you're away.** Results land in the
+  conversation that asked in the order the tasks finished. If that conversation is still unread a
+  few seconds later, OpenBot tells you once by push, Slack or Teams. A result that can't be written
+  yet is tried again, further apart each time, for up to a day. A routine set up in a task's thread
+  belongs to the conversation that asked.
+- **Work carried on after an approval continues at once after a restart or deploy**, where a task
+  could read Working for up to 15 minutes.
+- **A Bot finishes a long list with subagents instead of stopping partway.** One answer could start
+  five subagents in all, so a Bot given twelve accounts or documents to work through ran out after
+  five and did the rest itself, one by one, or left them. Now up to 10 run at once and any more
+  wait their turn, up to 100 in one answer, and a Bot past that is told to do the rest itself. Both
+  numbers are settings, `BOT_SUBAGENTS_AT_ONCE` and `BOT_SUBAGENTS_PER_ANSWER`, and in the Helm
+  chart `config.subagents.atOnce` and `config.subagents.perAnswer`.
+- **A task shows once in the conversation that asked.** A result posted right under its own task's
+  card no longer repeats the task's title and link, which the card already has. A result that
+  lands after something else keeps them, so it still says which task it is. A stopped task's
+  result reads stopped, where it showed a green check.
+- **A subtask that called no tool says "Answered directly"**, where its line in the task thread
+  said nothing and the Bot reported it took 0 steps. Task details says how long the task worked.
+- **A long run that finished keeps its answer.** On Bots on the Claude Agent SDK harness, about one
+  multi-step run in 20 ended with "The Bot stopped before it finished answering" though the work
+  was done, and a task tried again after that kept the first try's failure line. A failure a task
+  will try again is now said only if the last try fails too.
+
+### Conversations
+
+- **Bots talk about their work in plain words.** They are told never to name a tool, a function or
+  an app action's code name, never to say how their tools are found or loaded, and never to quote
+  an error the way a tool gave it, so a reply says "the Teams post didn't go through", not "No such
+  tool available".
+- **A conversation keeps its name** when it and a subagent's conversation are named at the same
+  moment, where the sidebar could go back to calling it by its first message until a reload.
+- **Maths draws as formulas.** LaTeX a Bot writes (`\( \)`, `\[ \]`, `$$`) is drawn as formulas in
+  replies, task threads, cards, group conversations, tool results and skills, where it showed as
+  source. A single `$` stays a dollar sign and code stays as written. A wide formula scrolls in its
+  own block. The renderer and its fonts load from OpenBot itself, the first time a formula
+  appears.
+- **Pick the model on the home screen.** The home message box has the model picker. Your pick is
+  saved with the conversation of whichever Bot answers. A Bot that hands work to agents, or runs on
+  an agent of its own, doesn't take the pick, and a notice says so with Open Agents.
+- **A model nothing answers at says so.** On Bots on the LangChain and Claude Agent SDK harnesses,
+  the Personal Assistant among them, an AI model address with nothing listening, a host that
+  doesn't exist or one that never answers ends the turn with "OpenBot couldn't reach the AI model
+  at host:port" and what to check, where it said only that the Bot stopped before it finished, or
+  read as the provider refusing. Only the host and port are shown, never a key or password in the
+  address. On the Claude Agent SDK harness it can take about three minutes, because Claude Code
+  retries the connection first.
+- **Attach files before a new conversation's first message.** On the home screen and New
+  conversation, files you pick, paste or drop go with the first message, so the Bot reads them on
+  that turn. If a file is refused, your words and files go back in the box with the reason. A group
+  conversation's first message still takes no files.
+- **A file you attach stays a file once the Bot answers.** On a Bot that runs behind an AG-UI
+  address, such as the Personal Assistant on LangChain, a text file you sent turned into one block
+  of its own contents when the answer finished, and an image's thumbnail disappeared. The message
+  now keeps the file as you sent it, during the answer, after it and after a reload. Messages
+  already turned into text stay as they are.
+- **Switching back to a conversation the Bot is working in shows it working.** Leave a
+  conversation while the Bot works and come back in the same window: it could be empty, with no
+  sign of the Bot, until the whole answer appeared at once. The conversation now picks the work up,
+  the answer streams in, and a message typed meanwhile waits for the turn, as it does when you
+  never left.
+- **A conversation that went quiet ends instead of running forever.** When a run sends nothing for
+  45 seconds, the app asks whether it is still going. If it isn't, the turn ends and what was saved
+  is shown, with "Send a message to carry on"; if nothing can say, it says OpenBot lost touch with
+  the Bot. Before, it showed Running and Stop for good. Opening a conversation while the live
+  updates aren't answering now opens it normally after a few seconds, where it stuck with no
+  history.
+- **A Bot no longer does an app change twice after you answer an approval.** When a built-in Bot
+  asked for several app changes at once and one waited for your Allow, the Bot was told the others
+  had not run, and did them again. It is now told what they did. And when the conversation can't
+  be carried on after an approved action, the step says what came of the action, and the Bot's
+  next turn gets that result.
+- **Replies fit the question.** Bots are told to answer "Can you...?" with a yes or no and an
+  offer, to claim only what their tool results show, to try an empty search another way before
+  saying nothing exists, and to ask which one when a name fits more than one person or thing,
+  never to pick. When a lookup finds several, OpenBot holds back the first change that would use
+  one of them until the Bot has asked.
+- **Allow once is for the action you saw.** It lasts ten minutes from your answer. If the action
+  changed, or the time passed, nothing is done and the request comes back to you with a line
+  saying what changed.
+- **Share approvals show everything that will be sent.** The card carries the whole text, with Show
+  all, where it was cut at 280 characters; in Slack and Teams it shows who will read it and the
+  text, up to 2,000 characters. A hand-off you decline, or one refused after Allow, leaves its task
+  Couldn't finish. A Bot on OpenBot's own harness that hands work to another person's Bot asks with
+  the card instead of stopping.
+- **A reply a Bot posts on its own shows in the conversation you have open**: from a routine, a
+  goal, a follow-up, Slack, Teams, a text message or the phone app, or a turn carried on after a
+  sign-in, an approval or in a task, even when it repeats an earlier reply word for word.
+- **A computer step that finds the computer waiting on you in another conversation says so**,
+  where the turn waited with nothing said.
+- **A finished reply stays where it was written.** Scrolling down once a reply had finished could
+  drop it from under your question onto the message box.
+- **Slack mentions in a Bot's reply show as names**, never as `<@U...>` ids. `@here`, `@channel`
+  and `@everyone` read as in Slack.
+- **A failed app call draws as failed**, and an app's answer draws without its leading "Ran:" line,
+  so its JSON renders as JSON again. A long app action is named by its whole name, not a shortened
+  one with a hash.
+- **Hand over the browser when you ask.** Asked to let you take over the browser or type a password
+  yourself, the Bot hands you the browser rather than showing the one-field secret box.
+
+### Bots and apps
+
+- **Mastra can be added as a Bot or as an agent.** New Bot and a Bot's add-agent sheet list Mastra
+  among the frameworks. Give the address of your Mastra server itself, not an AG-UI route: OpenBot's
+  server checks it against Mastra's own API before saving, and says under the address why when it
+  can't. The server has to run one agent.
+- **Add any MCP server by its address.** Connections has Add server: give a remote MCP server's
+  https address and OpenBot asks it how it is reached. A server that signs people in has each person
+  connect their own account; one that needs a key takes a key, which in the team edition only an
+  admin can give. With the MCP allowlist on, an admin approves the address first, and allowlist
+  entries can now be addresses. A tool the server marks read-only, and not destructive, counts as
+  a read, so it doesn't ask where changes ask; rules you or an admin wrote still apply. Signing in
+  to a server needs `OPENBOT_PUBLIC_URL`. `OPENBOT_ALLOW_LOOPBACK_MCP=1` admits a server on this
+  machine, for development only.
+- **A Bot makes an app change once per turn.** The same change asked for twice in one turn is made
+  once, and the second call gets the first one's result. A change whose outcome is unknown, after a
+  timeout or a dropped connection, isn't sent again until the Bot has read that app. This holds
+  across server replicas. Arcade and Composio actions are sent once everywhere. Asking again in a
+  new message does it again.
+- **A Bot stops repeating an app call that keeps failing.** Once the same call, with the same
+  arguments, has failed twice in a turn, OpenBot stops sending it and tells the Bot to change it or
+  do it another way.
+- **Every app answer tells the Bot what happened.** It opens with OpenBot's line saying whether the
+  call ran and what changed, ran read-only, partly ran, or failed, with the kind of failure and
+  what to try. A value the model writes as text where the app's schema names a number, a true or
+  false, an object or a list is sent in that type.
+- **Built-in Bots finish longer app tasks in one turn.** A chat turn has 40 model steps, and 8
+  more when the Bot searches its tools, where it had 8 and 2.
+- **Finding the right action among many.** Tool search weighs the apps a conversation has named or
+  used, and a Bot at an address is given OpenBot's tool search when it holds more actions than one
+  request carries. The most-used actions of Gmail, Google Calendar, Google Sheets, Google Drive,
+  Slack, Notion, Linear and HubSpot carry OpenBot's own descriptions, and `OPENBOT_TOOL_GUIDES`
+  names a JSON file that replaces, adds or removes them. With several large apps connected, a
+  message no longer fails with "Runtime info request failed".
+- **Payments ask by what the action is, not what it writes.** A Google Sheets row that says
+  "Payment due" is no longer treated as paying money. An action named for a charge, payment,
+  refund, payout, transfer, checkout or order, or one that fills a field such as `card_number` or
+  `iban`, still always goes to the person.
+- **A Bot's computer has Python.** Python 3 with openpyxl, pandas, python-docx, python-pptx,
+  matplotlib, pypdf, pdfplumber and reportlab is installed in the Bot's computer and in OpenBot
+  Desktop's folder sandbox, and built-in Bots are told what their computer can run.
+- **Standing instructions reach Bots on OpenBot's own harness.** A Bot on the harness picked at
+  setup, and the managed Bot, follow your standing instructions, after OpenBot's own rules. A Bot
+  at an address an admin added is never sent them.
+- **A person can only allow a Team Bot an app it uses.** Allowing it to use your account for any
+  other app is refused with "That app isn't one this Bot uses.", where the answer was kept and took
+  effect without asking on the day the Bot was given that app.
+- **Turning on many of an app's actions for a Bot saves in one step.** Activity records one row for
+  the actions turned on and one for those turned off, each naming its actions, where it had a row
+  per action; a script that reads the audit trail row by row sees fewer rows.
+- **A model key added in Vault is one the Bots use.** Add key for a model asks only which provider
+  it is for, starts on the one the Bots run on, and says whether the Bots will use it. A key saved
+  this way is filed where the built-in Bots read it, where before it could be saved under a name
+  nothing read.
+- **Claude Agent SDK Bots.** App actions with names past Anthropic's 64-character limit can be
+  called. OpenBot's own tools and tools already used load up front. A turn that searches its tools
+  in the same step as an app call finishes its answer, where it ended with none. Behind a gateway
+  (`ANTHROPIC_BASE_URL`), tool search is on, so a request no longer carries every app tool; a
+  gateway that can't pass tool search on needs `ENABLE_TOOL_SEARCH=false`, which Compose hands to
+  the harness. A task on this harness is sent the app actions its brief names and finds the rest
+  through OpenBot's tool search, where it could be answered "No such tool available".
+- **LangChain Bots.** A call to a tool not offered for that step is handed back to be answered
+  instead of ending the run. An OpenAI model that takes tools only through the Responses API is
+  called there behind `OPENAI_BASE_URL` too, where every run with a tool was refused.
+- **A Bot's computer starts when its Screen is opened**, as it already did for its Terminal, and
+  Activity names a computer turned off while idle and turned on again. Where OpenBot has no
+  computers for Bots, Admin's Computers, a Bot's Computer page, the Computer panel and saved logins
+  say so, where the panel waited minutes and then said it couldn't show the screen. Opening or
+  reading a conversation no longer starts a stopped computer or keeps an idle one running.
+- **A Bot's shell and browser are steadier.** A command with an unclosed quote comes straight back
+  instead of waiting out its whole timeout, a deep folder's prompt no longer shows as the last line
+  of a command's output, and Forward pressed right after Back is no longer refused as a page that
+  didn't load.
+- **Activity on a Bot's computer reads plainly.** Steps are named by their control, every row keeps
+  its time across a reload, and an allowed step says how it was allowed. A Bot's browser steps are
+  listed as before.
+- **Folders granted to a Bot on OpenBot Desktop say what failed.** A command that fails returns its
+  exit code and output, with a hint when the sandbox is the cause; a timeout or out-of-memory stop
+  says so; long output keeps its end; and when nothing ran it says what to do. An approval answered
+  after OpenBot stopped waiting runs nothing and says so, dialogs show one at a time, their time
+  starts when they show, and choosing a folder a Bot already has reuses its grant. An approval left
+  unanswered no longer ends the folder's grant, so later commands there still ask, where each came
+  back "Host grant was revoked.".
+- **Connecting an app through Composio says who Composio is first.** Before the sign-in for Gmail,
+  Google Calendar, Slack or another app from the directory, OpenBot shows a step that names the
+  app, says Composio is the service that holds OpenBot's app connections, and says the next page
+  will ask you to allow Composio, which is expected (for Slack, so is "App not approved by Slack").
+  It moves on after 5 seconds, or at once with Continue now, and Cancel stops it. On OpenBot
+  Desktop, the page your browser comes back to says "Gmail is connected" (or that it couldn't
+  connect) and counts down 5 seconds before handing you back to the window, where it went at once.
+  Arcade, apps that take a key and the apps OpenBot signs in to itself are unchanged.
+- **An app call with a parameter the action doesn't take is refused before you're asked.** The Bot
+  is told the parameters the action does take, so you approve the corrected call once, where a
+  Slack post sent with the wrong field could ask you twice.
+- **Arrow keys in a dropdown on a Bot's computer count from the top.** The computer's screen
+  pointer sat in the middle of the screen, and a list that opened under it could move the choice,
+  so two presses of the down arrow could pick the wrong option.
+
+### Pages and routines
+
+- **Pages are grouped by the eight things a Bot has, and some have new names.** A Bot has
+  Conversations, Routines, Memory, Skills, Apps, a Computer, Approvals and Activity
+  (`docs/how-openbot-works.md`), and a Bot's page, the main menu and Settings, and Admin now
+  list them in that order. What moved:
+  - **Vault**, under Settings, holds your saved logins and your keys. It replaces Saved logins,
+    Passwords and Credentials.
+  - **Routines**, **Memory** and **Skills** are in the main menu beside Bots and Connections,
+    because they are things you make and come back to. Teach a Bot is no longer in the main menu:
+    open it from the Skills page.
+  - **Connections has two sections.** **Your apps** lists what your Bots use. **Add an app** lists
+    everything else, the apps that need a key included, and ends with Browse apps. The count and
+    **Show apps that need setup** are gone, and so is Routines, which every Bot already has.
+  - **Skills** holds the skills you wrote, the skills learned from your recordings and the
+    ones waiting for your review. It replaces Capabilities > Skills and Settings > Learning.
+  - **Settings > Computer** is one page. Browsers and This computer are sections of it.
+  - **Routines** is one list of routines, goals and check-ins, for one Bot and for every Bot.
+  - In Admin, Plugins is now **Apps**, Audit is **Activity**, Credentials is **Vault**, and
+    Check-ins are under **Routines**. The Team group is now **Organization**, with People and
+    Teams. Settings has Organization, and API keys under You.
+
+  Nothing was removed, and every old address opens the page that replaced it.
+- **One New routine screen for routines, goals and check-ins.** New routine no longer opens a menu
+  of Routine, Goal and Check-in. One screen, in sections, asks what to do, whether the Bot should
+  act for you or only tell you, what starts it (a schedule, an event such as a GitHub issue
+  opening, or now, once) and, optionally, when it is done. A schedule with nothing in Done when
+  makes a routine; an event, or anything with Done when, makes a goal, shown as one Goal row with
+  its schedule under Starts; Only tell you makes a check-in. A goal can now be saved with no
+  outcome.
+- **A goal can end when its outcome is met.** A goal made with an outcome is completed by the run
+  that meets it, and completing a goal switches off the routines that run it. A goal that repeats
+  with no outcome is still ended only by you.
+- **Every routine, goal and check-in opens on a page of its own.** A row on Routines is a link to
+  `/routines/goals/<id>`, `/routines/schedules/<id>` or `/routines/check-ins/<id>`, which can be
+  opened in a new tab, and the page's back link returns to the list it came from. Each page holds
+  what its dialog held, and Delete returns to Routines. A goal can be deleted, and deleting it also
+  deletes every routine that runs it, unless one still runs another open goal or only ran it on
+  some of its firings (below).
+- **Routines say what starts a goal in words**, such as "When a GitHub check finishes", and keep
+  the exact event under them on the goal's page. Check-ins say "Next check in 24 hours" rather
+  than a date and time.
+- **A Bot's Routines row counts what the Routines page lists**: a goal and the routine that runs it
+  once, and the check-ins that are on.
+- **Completing or deleting a goal does the right thing to its routines, whatever the goal is called
+  now.** A routine made for a goal is switched off when the goal is completed, even after you
+  renamed the goal. A broad routine that only sometimes runs a goal ("Summarize my inbox, and if a
+  release shipped run the goal") keeps running when that goal is completed or deleted, and loses
+  only the link. A routine is never linked to a goal that is already complete or paused. A routine
+  made before 0.3.3 runs a goal only where its instruction clearly does, not wherever it quotes the
+  title. And a Bot is told never to make work you want every time end when it is met.
+- **Fixes to Routines and New routine.**
+  - A goal made to start **Now, once** with a Done when ends once that is met.
+  - Routines are read again every 10 seconds, as goals already were, so a goal a run completed no
+    longer shows its schedule on until the page is opened again.
+  - New routine no longer takes over a check-in the Bot already has: Create says so and nothing
+    changes. Accepting a Bot's offer still turns a matching check-in back on.
+  - **Create routine** stays enabled while a field has a message. Pressing it moves to the first
+    field with one, and a screen reader reads each message with its field.
+  - A routine that runs a goal, listed on its own, says "Runs a goal" where it showed the
+    instruction written for the Bot.
+  - When your browser's time zone isn't one OpenBot knows, New routine says to ask your Bot to set
+    the routine up.
+  - The Routines page no longer warns that routines aren't running: that was for a deployment with
+    no worker, which is no longer a state.
+
+### Finding things
+
+- **Cmd/Ctrl+K opens a command palette** anywhere signed in. It finds pages, Bots and
+  conversations and opens them; it can't send, approve, run or delete anything, and it never lists
+  a page you can't open. In a Bot's browser the shortcut goes to the browser.
+- **Searching conversations searches all your history on the server**, by name and recent
+  messages, instead of only the conversations already loaded in the sidebar, with the
+  conversation list's own rules for who can see what.
+
+### Personal edition
+
+- **Only requests that carry the install's token are let in.** OpenBot Desktop makes the token
+  once per install and keeps it in the system's credential store, never in `.env`, and it stays the
+  same across restarts, upgrades and a put-back to an earlier version. Compose hands it to the
+  server alone. The window enters once through an address that leaves it a cookie, and a program of
+  yours sends `X-OpenBot-Install-Token`. A request without it, a Bot's own computer included, is
+  refused, and a browser refused this way shows "Open OpenBot from its app". `scripts/start.sh`
+  makes the token, writes it to `.env` and prints the entry address as its Ready line, and both
+  charts' single-user mode make one and keep it across upgrades. An app sign-in that ends in your
+  browser hands back to the window, which finishes it. The team edition is unchanged.
+- **API keys work in the personal edition.** Settings > API keys lists, creates and deletes your
+  keys, where it said "Couldn't load your API keys". A key works on `/api/v2` only, is shown once,
+  can't make a key, and needs no install token.
+- **Admin is in the personal edition too**, under your name. Its pages open where they used to
+  send you to Settings. Providers, model usage and check-in history show your own Bots. Pages and
+  controls that only apply to a team say "This applies when OpenBot runs for a team." with a way to
+  OpenBot for Business.
+- **Connections lists the search providers, GitHub and Composio's apps.** The built-in Google Drive
+  and Notion are no longer offered, because Composio carries both. One already added stays listed
+  and keeps working.
+- **New routine doesn't offer Slack** as an event source: the personal edition has no Slack, so a
+  goal it started never ran.
+- **A personal owner is never told to ask an admin.** Stopped routines say to restart OpenBot, a
+  Connections page that couldn't load offers Retry and Setup, and a Bot's Apps page with no app
+  connected says "Connect one on Connections." with a link.
+- **OpenBot for Business opens in the app.** Meet OpenBot for Business, Book a call and the link
+  about a computer for each Bot open a dialog with the booking calendar, instead of a website tab.
+  If the calendar can't load, Book a demo opens the page in your browser.
+
+### OpenBot Desktop
+
+- **A first install no longer stops at "Connecting OpenBot" when your home folder is a git
+  repository.** On a Mac whose home folder is a repository that ignores everything, a common way to
+  keep dotfiles, setup stopped with "Setup stopped partway through with an error", and Retry failed
+  the same way every time: git looked up from OpenBot's folder into the home repository, whose
+  rules hid OpenBot's own files. Setup now keeps git to OpenBot's folder. A repository you keep in
+  OpenBot's folder itself is still read.
+- **A setup step that stops offers its troubleshooting logs.** When Finishing setup or Starting
+  OpenBot stops with an error, Copy logs and Save to a file are under Retry, where the card said to
+  copy the logs below and showed none, and the logs now say why the connect step stopped.
+- **OpenBot Desktop can connect to an OpenBot that runs somewhere else.** At set-up choose
+  **OpenBot for Business**, or later Settings > Computer > **Connect to an OpenBot**, which stops
+  OpenBot on this computer first. Type the https address of your company's OpenBot. Nothing is
+  installed or downloaded, and no CopilotKit account, license or model key is asked for: you sign
+  in in your browser, and the app keeps the sign-in in Keychain or Windows Credential Manager,
+  never in a file. While connected, Start, Stop, Status, model keys and local folders for Bots are
+  not shown, Quit only closes the app, and you can switch organizations. Settings shows where you
+  are connected, with Sign out and **Use OpenBot on this computer instead**, which loses nothing.
+  It needs an OpenBot of this release or later, and refuses one set up for one person on their own
+  computer. Setup's big downloads now start when you press Install, not when the first screen
+  opens.
+- **OpenBot Desktop is one address.** With CopilotKit Intelligence on the same machine, the app
+  used to open a second connection, straight to Intelligence's gateway on a port of its own. It now
+  opens everything on OpenBot's own address: the server carries that socket
+  (`INTELLIGENCE_GATEWAY_PROXY`, which `docker-compose.yml` turns on for a gateway on this
+  machine). Nothing is moved or rewritten in an installation; the change takes effect at the next
+  Start. An Intelligence somewhere else, managed Intelligence among them, is reached at its own
+  address as before. OpenBot run from a checkout (`scripts/start.sh`) does the same only when
+  `OPENBOT_PUBLIC_URL` is set, and otherwise keeps the gateway's own port.
+- **The first setup screen says what Self-hosted needs**: a Mac or a 64-bit Windows PC, 16 GB of
+  memory, 4 CPU cores and 40 GB of free disk.
+- **Setup waits for room on a full drive instead of stopping.** It pauses with how much is free and
+  Try again, checks every 10 seconds, and carries on by itself once there is room.
+- **A Podman machine too small for setup is resized for you on a Mac.** Setup needs 4 CPUs and
+  4 GB of free memory. The row now says what your machine lacks ("Your Podman machine has 2 CPUs.
+  OpenBot needs 4."), and **Resize my Podman** stops your machine, raises what is short (at least
+  6 CPUs or 8 GB, never more than your Mac has), starts it again with the containers that were
+  running, and carries on. If the resized machine can't download yet, it says to check your
+  internet connection and Retry. Where OpenBot can't resize it, the fix is numbered steps, each
+  command with Copy. Setup's messages count CPUs in all, as setup does.
+- **A 4-CPU Docker or Podman no longer fails setup because something else is running in it.** The
+  CLI counts the engine's CPUs rather than those left free. Memory and disk are still measured
+  free.
+- **A first setup that stops in its image download carries on by itself once**, as Retry would.
+- **An OpenBot whose saved data is gone says so, and starts fresh.** When OpenBot's Podman machine
+  was removed (`podman machine reset`, a WSL unregister, or an older version uninstalled with its
+  data), every start stopped at "Setup stopped partway through with an error", and Retry did the
+  same. OpenBot now says plainly that its saved data on this computer is gone, with your Bots and
+  conversations, and offers **Start fresh**. Your sign-in and AI connection stay.
+- **OpenBot starts and stops more reliably.**
+  - Retry and the next Start run an unfinished back end update again when it left OpenBot running
+    but not working.
+  - OpenBot starts again by itself after an update; only your own Stop keeps it stopped.
+  - Retry starts OpenBot's engine when it stopped under a running OpenBot, where only Quit and a
+    relaunch helped.
+  - A Podman machine that says it is running but doesn't answer is stopped and started again.
+  - A back end that refuses to start straight after a Quit is asked again twice before setup
+    fails.
+  - When the engine stops under the open window, the window shows OpenBot as stopped, with Start.
+  - Quit and Stop treat a stopped Podman machine as nothing left to stop, and the last run's
+    shutdown notice clears once Start runs.
+  - After an update, the previous release's images are removed, freeing about 3 GB.
+- **Your default Podman connection is kept** whenever OpenBot makes, starts or removes its own
+  machine. Removing it could move your default to another of your machines.
+- **Windows.**
+  - Uninstalling with its data no longer breaks the next install: the uninstaller stops OpenBot's
+    containers first, and an installation already stuck at "Opening OpenBot" is repaired at Start,
+    by clearing only the port rules a removed OpenBot machine left behind.
+  - A lone Alt or F10 no longer freezes the window until a click.
+  - The title bar is dark from the first frame in dark mode, and follows every theme change.
+  - After an update OpenBot opens in front, or flashes in the taskbar where Windows won't allow
+    that.
+  - While WebView2 installs, the installer says so in plain words, and after Finish the window
+    shows "Getting OpenBot ready" rather than a blank white window.
+  - A fresh install no longer waits about two minutes on "Output folder".
+- **Mac.**
+  - Get Troubleshooting Logs... no longer quits the app after saving the file. While the logs are
+    gathered, the menu says Gathering Logs....
+  - The window opens on OpenBot's own background, with no grey and white flash.
+  - The window's buttons no longer cover a skin's controls, and a press anywhere along a skin's
+    top bar moves the window.
+- **A maximized or full-screen window reopens as it was**, and each Bot has one color everywhere.
+- **OpenBot Desktop 1.0.2 and 1.0.3 can start an installation a newer version updated.** For one
+  release, `container-images.json` names `agent-bot` and `agent-langgraph` again, both as the
+  server image, and `docker-compose.yml` defines two services of those names that nothing starts.
+  Those, the `worker` and `migrate` services below, the two commands they run in the server image
+  and the `routine_sweeps` table are all dropped in the release after.
+- **CopilotKit Intelligence 0.16.0-rc.13.** The bundled CLI moves to `copilotkit@7334f7d`, so
+  OpenBot Desktop's back end runs Intelligence 0.16.0-rc.13.
+- **A second OpenBot Desktop can run beside an installed one**, for testing, with
+  `OPENBOT_DESKTOP_PROJECT` set to another Compose project name.
+
+### Running OpenBot
+
+- **The server migrates and does the scheduled work itself.** It applies its own migrations when it
+  starts, and fires routines, cleans up unsent attachments and suspends idle computers in its own
+  process. Nothing starts the `migrate` or `worker` Compose service, nothing waits on `migrate`,
+  and the server is no longer handed `WORKER_SHARED_SECRET`. `docker-compose.yml` still defines
+  both services for this one release, doing nothing, behind its `x-openbot-scheduled-work: server`
+  line. OpenBot Desktop, `bash scripts/start.sh` and `bash scripts/stop.sh` remove the `worker` and
+  `migrate` containers an earlier release left, and run an earlier release's file as it requires.
+  `bun scripts/update.ts local apply` updates to and from a release of either kind, and
+  `bun scripts/update.ts kubernetes` accepts a chart whose server applies its own migrations.
+  With several replicas, one leads and decides which routines are due, and every replica runs
+  routine turns; each server keeps two PostgreSQL connections of its own for this, beside its pool.
+  `STAGED_ATTACHMENT_HOURS` sets how long a file attached but never sent is kept: 24 hours unless
+  set, and it must be above 0. A computer suspended, used again and left idle is suspended at the
+  next sweep, and several replicas starting together on a new database all come up, where one
+  could stop on a duplicate key.
+- **One image runs the server and every Bot's computer.** A release publishes
+  `ghcr.io/copilotkit/openbot` and `ghcr.io/copilotkit/openbot-supervisor`, for amd64 and arm64.
+  The server and the computer run from the one `openbot` image, each with its own command
+  (`/app/bin/openbot server`, `/app/bin/openbot-computer`). `SERVER_IMAGE` and `COMPUTER_IMAGE`
+  still name the image for each service. The computer's container is given none of the server's
+  settings. The first update downloads the whole image once, about 715 MB compressed on amd64 and
+  740 MB on arm64. The images are signed, and `docs/cosign.pub` is the key to check them with
+  (`docs/deployment.md`).
+- **The server checks its license and its Intelligence before it starts.** With
+  `COPILOTKIT_LICENSE_TOKEN` set, the license must be valid and current, and the key is not tried
+  instead. With none set, the server asks the Intelligence at `INTELLIGENCE_API_URL` whether it
+  accepts the project key, and stops when the key is missing or refused or that address never
+  answers. It also refuses an Intelligence that lacks an operation it calls, naming the oldest
+  version that has them all (0.16.0-rc.12). It asks again for up to ten minutes while Intelligence
+  is starting, and each refusal is one sentence that names the variable to fix. A demo license,
+  the kind the CopilotKit CLI issues, is refused outside the CLI's own local cluster, as
+  Intelligence refuses it, and only CopilotKit's own license keys are trusted.
+- **Running from a checkout pulls the published images.** `bash scripts/start.sh` pulls the server,
+  computer and supervisor images at the tag in `backend-images.env` on every start, falling back to
+  local copies when it can't, and runs them as Compose services, with the app served from the
+  checkout. `OPENBOT_BACKEND_TAG` in the environment or `.env` runs another build. The server's log
+  is `docker compose logs server`, and a server and worker an earlier start left on the host are
+  stopped first. The repository no longer builds the images or holds the Helm chart. The personal
+  edition's browser shows in the page, as in OpenBot Desktop, and `OPENBOT_PERSON_BROWSER`,
+  `BROWSER_PORT` and the helper that opened your own Chrome are gone. `.env.example` now points at
+  an Intelligence on this machine, with managed Intelligence as a commented option.
+- **A recording made in a Bot's browser saves when OpenBot runs from a checkout.**
+  `bash scripts/start.sh` sets `COMPUTER_LOOPBACK_RELAYS`, as OpenBot Desktop does, so the
+  Recorder in a Bot's browser reaches OpenBot. A value in the environment or in `.env` wins.
+- **Two checkouts on one machine no longer share the managed Bot's image.** It is tagged
+  `<project>-agent-langgraph-agui:latest`, with the stack's Compose project name. A checkout in a
+  folder named `openbot` keeps the tag it had. `LANGGRAPH_IMAGE` still names the image outright.
+- **SPIRE is gone.** It issued each Bot's computer a workload identity that nothing in OpenBot
+  checked. Its three services (`spire-init`, `spire-server`, `spire-agent`), their volumes and the
+  supervisor's `SPIRE_*` settings are removed; volumes an earlier stack made stay until you remove
+  them.
+- **The managed Bot is the LangGraph harness, `agent-langgraph-agui`.** `agent-bot` and the
+  TypeScript `agent-langgraph` are retired, with `BOT_PORT`, `BOT_IMAGE` and `AGENT_BOT_MODEL`, and
+  their images are no longer published. `scripts/start.sh` starts the harness on port 4201 and
+  points `MANAGED_AGENT_AG_UI_URL` at it, whichever provider `BOT_PROVIDER` names. OpenBot Desktop
+  takes the retired Bots' settings out of an updated installation's `.env`.
+- **Usage data says which release it came from, and carries error reports.** With usage data on,
+  every event names the OpenBot version and edition. The app's error screen, errors a page didn't
+  handle, and the server's uncaught errors and 5xx answers are sent as error reports, through the
+  server, with secrets, emails, addresses, paths and long numbers taken out and their size and
+  number capped. OpenBot Desktop reports when an update starts and how it ends, and the first
+  launch of a new version reports the update that brought it, once. With usage data off none of it
+  is sent. `docs/TELEMETRY.md` lists every field.
+
+### Kubernetes
+
+- **The `openbot` chart (0.3.0) is OpenBot alone, and `openbot-bundle` (0.1.0) is the all-in-one
+  install.** `openbot` no longer installs CopilotKit Intelligence: it points OpenBot at one that
+  already runs, managed or self-hosted, by its two addresses and a project key, so several OpenBot
+  releases can share one Intelligence. `openbot-bundle` installs OpenBot and Intelligence together
+  on one PostgreSQL server, with Intelligence 0.16.0-rc.13. The `openbot` chart can also make a
+  project and key of its own in an existing Intelligence organization, given that organization's
+  service token (`config.intelligence.project.create`). A release attaches both charts, with
+  `release-charts.json` naming them and their checksums.
+- **One address in a cluster too.** With `httpRoute` or `ingress` on and Intelligence in the same
+  cluster, the `openbot` chart routes `/client/websocket` on OpenBot's host straight to
+  Intelligence's gateway, and OpenBot's server stops carrying that socket. An existing release
+  changes over at `helm upgrade`. Set `config.intelligence.inCluster.edgeRoute: false` for a
+  gateway that won't upgrade a WebSocket to Intelligence's Service. An Ingress with Intelligence
+  in another namespace keeps the server carrying it.
+- **A release on the 0.2 chart with its bundled Intelligence is refused at upgrade to 0.3**, and
+  nothing in the cluster changes, because the upgrade would delete that Intelligence and its
+  conversations. Keep the release on 0.2, or install `openbot-bundle` as a new release. A 0.2
+  release that already pointed at an Intelligence of its own upgrades as before.
+- **No CronJobs and no migration Job.** The server fires routines, suspends idle computers,
+  deletes unsent attachments and applies its own migrations. `migrations.enabled: false` is
+  refused, with what to do instead. `attachments.culler.olderThanHours` reaches the server as
+  `STAGED_ATTACHMENT_HOURS`, and `server.waitForDatabaseSeconds` bounds how long a server pod waits
+  for its database. The values that configured the removed jobs (`routines`,
+  `computers.sandbox.culler`, `secrets.workerSharedSecret`, and `attachments.culler.enabled`,
+  `.schedule` and `.activeDeadlineSeconds`) are ignored.
+
+### Appearance
+
+- **OpenBot follows your system's light or dark setting.** Settings > General has a Theme row with
+  System, Light and Dark, in place of the Dark theme switch, and everybody starts on System. The app
+  switches when the system does, with no reload, and OpenBot Desktop's window follows it.
+
+### OpenBot runs on CopilotKit 1.88.0
+
+`@copilotkit/react-core` in the app and `@copilotkit/runtime` in OpenBot's server move from 1.85.0
+to 1.88.0. AG-UI stays 1.0.2.
+
+### Smaller changes
+
+- In the OpenDots skin, the badge on Bots sits on the corner of the Bots icon, and a count is a
+  smaller circle.
+- New Bot's first screen ends with a **Bring your own agent** card showing the mark of every
+  framework a custom agent can run on, in place of the **Connect a custom agent** button.
+- The Bots page lists the Bots you can use first and leaves out empty sections. Lists draw their
+  rows' shape while they load, and Needs you says which part didn't load, with Retry. The message
+  box shows no plus when there is nothing to attach. A Bot's Skills page no longer waits for its
+  apps.
+- Connecting an app that takes a key says "OpenBot connects to Fireflies with a key from your
+  Fireflies account, not a sign-in.", where it said the app had no sign-in.
+- Delete dialogs name what they delete, and a personal conversation's no longer says "for everyone
+  in the conversation". Key-check banners no longer show an app's raw JSON error.
+- Admin > Providers > Usage says "Model not reported" and how a model is known, where it showed
+  `remote:<id> · unknown`.
+- The masked secret box tells the Bot a secret was entered only once the computer confirms it.
+- Record stays on screen beside a Bot's full-size screen in a narrow window.
+- After an app's consent screen, the address no longer carries the broker's report.
+- After you delete a routine, goal or Bot, or disconnect an app, the page stops asking for it.
+- An unticked tickbox's edge stands out at 3:1 or better, in light and dark.
+- A task that couldn't finish says why once, and offers Try again only where it could help. A
+  dismissed app request says so, and the Bots badge updates on Allow and Deny.
+- A Learning proposal's "Supported by" line is left out whole, whatever case its aliases are in.
+- Setup's usage data checkbox stays where it is while the step's rows arrive.
+- Check again on Setup asks about a model key added a moment ago, where within ten seconds of the
+  last check it still said the key hadn't been checked.
+
+## 1.0.3
+
+- The OpenMuse skin is now called OpenFuse. Anyone who picked it keeps it, with nothing to
+  choose again.
+- A Microsoft Agent Framework Bot on an Anthropic key sends the key again. Its image holds
+  `agent-framework-anthropic` at 1.0.0b261106, as `main` does, because 1.0.0b261112 (released
+  2026-11-12) sends the request without it.
+
+## 1.0.2
+
+**Before upgrading.** No migrations run in this release: the database stays at
+`0088_approval_reviewer_guidance`, and a 1.0.1 database is used as it is. Upgrading from 1.0.0 or
+0.3.x runs the migrations listed under 1.0.1, and a database that has run them does not go back:
+restore the backup taken before the upgrade instead. Three things change for an existing OpenBot
+Desktop installation:
 - On Windows OpenBot now always runs in a Podman machine of its own, `openbot`, beside any of
   yours, and on a Mac it does when yours is rootless, after asking to pause it (below). An
   installation that ran in a machine of yours starts fresh in `openbot`, and its earlier data stays
@@ -27,55 +1398,11 @@ every deployment:
 - At setup and at every Start, a Docker Desktop or Podman too old to run OpenBot is updated
   (below). Docker Desktop quits while it updates, which stops its containers; the ones that were
   running are started again afterwards.
-- OpenBot Desktop's back end moves to CopilotKit Intelligence 0.16.0-rc.13 and the Helm chart to
-  0.16.0-rc.12, and the bundled CLI to `copilotkit@7334f7d` (below).
-- Settings and Admin are grouped differently and several pages have new names (below). Old
-  addresses and bookmarks open the new pages.
+- OpenBot Desktop's back end and the Helm chart move to CopilotKit Intelligence 0.16.0-rc.11, and
+  the bundled CLI to `copilotkit@7bd073b` (below).
 
 ### OpenBot Desktop
 
-- **Get Troubleshooting Logs… no longer quits OpenBot Desktop on a Mac.** Chosen from the OpenBot
-  menu, it could seem to do nothing for a few seconds and then close the app, after saving the
-  file. macOS refused to show the file in Finder from where OpenBot asked. It now asks from the
-  right place, and a Finder that can't open is noted in the log. While the logs are gathered, the
-  menu says Gathering Logs… and the item can't be chosen again.
-- **A Podman machine too small for setup is resized for you on a Mac.** Setup needs 4 CPUs and
-  4 GB of free memory. A Podman machine with less stopped at one sentence with a command squeezed
-  into it: "OpenBot has 2 CPUs. It needs 4. Stop your Podman machine, run podman machine set
-  --cpus 6, start it again, then Retry." The row now says only what happened ("Your Podman machine
-  has 2 CPUs. OpenBot needs 4."), and OpenBot offers **Resize my Podman**: once you click it, it
-  stops your machine, raises whichever of its CPUs and memory is short to what setup needs (at
-  least 6 CPUs or 8 GB, never more than your Mac has), starts it again with the containers that
-  were running in it, and carries on setting up. Nothing else about your machine changes. Where
-  OpenBot can't do it (your disk is short too, or Podman refused the change), the same fix is three
-  numbered steps, each command in its own block with Copy, then Retry. Setup's other messages about
-  CPUs now count them as setup does, in all: "Docker Desktop has 2 CPUs. OpenBot needs 4.", where
-  they said "free CPUs".
-- **On a Mac, the window's buttons no longer cover a skin's controls.** With the OpenDuet skin the
-  close, minimise and zoom buttons sat on the "OpenBot" name at the top of the menu, and on the back
-  button of every page opened over the app. OpenDots and OpenFuse had their own controls under them
-  too, in some window sizes. Each skin now leaves that corner clear, as OpenBot's own sidebar does.
-  In a browser and on Windows nothing moves.
-- **On a Mac, a skin's top bar moves the window.** With OpenDots, OpenDuet or OpenFuse, only a few
-  pixels at the top of the window could drag it, and a press on the bar selected its text. Now a
-  press anywhere along the top, outside a button or link, moves the window, and a double-click
-  zooms it, as in OpenBot's own layout.
-- **An OpenBot whose saved data is gone says so, and starts fresh.** When OpenBot's Podman machine
-  was removed (`podman machine reset`, a WSL unregister, or an older version uninstalled with its
-  data), its backend and database went with it, but the installation still named them. Every start
-  then stopped at "Setup stopped partway through with an error. Retry.", and Retry did the same,
-  even after reinstalling. OpenBot now says plainly that its saved data on this computer is gone,
-  with your Bots and conversations, and offers **Start fresh**, which installs OpenBot's software
-  again, sets OpenBot up and opens it, moving forward the whole way, never back a step.
-  Your sign-in and AI connection stay. Setting up again also replaces a backend that is gone,
-  where it used to stop the same way.
-- **Uninstalling OpenBot with its data no longer breaks the next install on Windows.** When
-  OpenBot's backend couldn't be stopped, uninstalling with "Delete the application data" removed
-  OpenBot's Podman machine with its containers still running. Their port rules stayed in the network
-  WSL shares between machines while another Podman machine of yours kept it up, and the next install
-  of OpenBot stopped at "Opening OpenBot". The uninstaller now stops every container in OpenBot's
-  own machine first, which takes their rules with them, and removes OpenBot's rules itself if they
-  won't stop. Your own machines' and Docker's rules are never touched.
 - **Installing a new OpenBot over the old one on Windows never offers to delete your data, and
   uninstalling stops what OpenBot runs.** Running a new installer over an installed OpenBot opened
   the old version's uninstaller in the middle of the update, with a "Delete the application data"
@@ -160,7 +1487,7 @@ every deployment:
   OpenBot Desktop downloads what it runs in the background while you keep working: the parts for
   the Bots you use, and the back end's when it changes too, kept until you update. Clicking Update
   then stops OpenBot, backs it up, updates it and starts it again, with nothing big left to
-  download. The update offer, Settings › Computer and the setup window say the new version
+  download. The update offer, Settings › This computer and the setup window say the new version
   "is downloading in the background (40%).", then that it "is ready to install. It takes a few
   minutes." It downloads one part at a time, waits while OpenBot starts, stops or updates, never
   stops or restarts anything you are using, and downloads nothing when the disk is short of room
@@ -168,9 +1495,9 @@ every deployment:
   which do not update themselves, download nothing ahead.
 - **downloads.copilotkit.ai serves each release's `desktop-images.json`.** It answered 403, so the
   list of a release's images could only come from GitHub.
-- **The Status window, Settings > Computer and the Install step say what's running in plain
-  words.** The Status window, opened from the menu bar or the system tray, and Settings > Computer
-  said "Back end", "Container engine", "Podman" or "Docker" and the build's commit and
+- **The Status window, Settings > This computer and the Install step say what's running in plain
+  words.** The Status window, opened from the menu bar or the system tray, and Settings > This
+  computer said "Back end", "Container engine", "Podman" or "Docker" and the build's commit and
   time. Both now name each part by what it does: App, OpenBot's services, and Software OpenBot runs
   on, with "App and Bots" for what was "Front end and Bots". They show the version on its own, and
   the engine, the build and Docker's container names stay in Copy diagnostics and the logs. A
@@ -244,146 +1571,16 @@ every deployment:
   `localhost`, `127.0.0.1` and `[::1]` with the same port as the same address, connects again, and
   leaves OpenBot's addresses as they are. An address changed to another port or host is still
   refused.
-- **CopilotKit Intelligence 0.16.0-rc.13, CLI `copilotkit@7334f7d`.** OpenBot Desktop's back end
-  moves to Intelligence 0.16.0-rc.13 and the Helm chart to 0.16.0-rc.12, and the bundled CLI to its
-  production build. The CLI is `6bfaa0f5c`, which added `telemetry link`, with `--app-path` added to
-  its `local` commands and a second `local connect` accepted after OpenBot rewrote its addresses to
-  `127.0.0.1`, and CopilotKit v1.87.0 templates. The back end now streams an answer whole to a
+- **CopilotKit Intelligence 0.16.0-rc.11, CLI `copilotkit@7bd073b`.** OpenBot Desktop's back end
+  and the Helm chart move to Intelligence 0.16.0-rc.11, and the bundled CLI to its production
+  build. The CLI is `6bfaa0f5c`, which added `telemetry link`, with `--app-path` added to its
+  `local` commands and a second `local connect` accepted after OpenBot rewrote its addresses to
+  `127.0.0.1`, and CopilotKit v1.85.0 templates. The back end now streams an answer whole to a
   conversation that starts following it mid-reply: before, it could send the reply's pieces out of
   order, so the answer drew with words missing and a step's browser actions never ran.
-- **A reply read right after it finished could be missing a piece.** The back end saves a reply's
-  pieces to its database a moment after they stream, and it used to save them in no particular
-  order. A conversation opened, or a reply read, just as the reply finished could get it with a
-  piece missing from the middle, though the person had watched it stream whole, until the rest was
-  saved about a second later. Intelligence 0.16.0-rc.13 saves each reply's pieces in the order they
-  streamed, so a reply read early is at most cut short at the end, never missing a piece.
-- **A 4-CPU Docker or Podman no longer fails setup because something else is running in it.**
-  Setup's resource check counted the CPUs left free, the engine's less what its running containers
-  used at that moment, so OpenBot's own 4-CPU Podman machine with anything at all running in it
-  measured 3.9 and stopped with "It needs 4". The CLI in Intelligence 0.16.0-rc.12 counts the
-  engine's CPUs instead, since containers share CPU time rather than hold it: an engine of 4 CPUs or
-  more passes whatever runs in it. Memory and disk are still measured free, as before.
-
-### Pages and routines
-
-- **Pages are grouped by the eight things a Bot has, and some have new names.** A Bot has
-  Conversations, Routines, Memory, Skills, Apps, a Computer, Approvals and Activity
-  (`docs/how-openbot-works.md`), and a Bot's page, the main menu and Settings, and Admin now
-  list them in that order. What moved:
-  - **Vault**, under Settings, holds your saved logins and your keys. It replaces Saved logins,
-    Passwords and Credentials.
-  - **Routines**, **Memory** and **Skills** are in the main menu beside Bots and Connections,
-    because they are things you make and come back to. Settings keeps what you set once:
-    Computer, Approvals and Activity. Teach a Bot is no longer in the main menu: open it from the
-    Skills page.
-  - **Connections has two sections.** **Your apps** lists what your Bots use. **Add an app** lists
-    everything else, the apps that need a key included, and ends with Browse apps. The count and
-    **Show apps that need setup** are gone, and so is Routines, which every Bot already has.
-  - **Skills** holds the skills you wrote, the skills learned from your recordings and the
-    ones waiting for your review. It replaces Capabilities > Skills and Settings > Learning.
-  - **Settings > Computer** is one page. Browsers and This computer are sections of it.
-  - **Routines** is one list of routines, goals and check-ins, for one Bot and for every Bot.
-  - In Admin, Plugins is now **Apps**, Audit is **Activity**, Credentials is **Vault**, and
-    Check-ins are under **Routines**.
-
-  Nothing was removed, and every old address opens the page that replaced it.
-- **One New routine screen for routines, goals and check-ins.** New routine no longer opens a menu
-  of Routine, Goal and Check-in. One screen asks what to do, whether the Bot should act for you or
-  only tell you, what starts it (a schedule, an event such as a GitHub issue opening, or now, once)
-  and, optionally, when it is done. From those answers it makes a routine, a goal, or a check-in:
-  a schedule with nothing in Done when makes a routine; a schedule or an event with Done when makes
-  a goal that ends once that is met, shown as one Goal row with its schedule under Starts; Only
-  tell you makes a check-in. A goal can now be saved with no outcome.
-- **A goal can end when its outcome is met.** A goal made with an outcome, on a schedule or an
-  event, is completed by the run that meets it, and completing a goal switches off the routines
-  that run it. A goal that repeats with no outcome is still ended only by you.
-- **Every routine, goal and check-in opens on a page of its own.** A row on Routines is a link to
-  `/routines/goals/<id>`, `/routines/schedules/<id>` or `/routines/check-ins/<id>`, which can be
-  opened in a new tab, and the page's back link returns to the list it came from. Each page holds
-  what its dialog held: a schedule's switch, Run now, its runs and Delete; a check-in's switch, Run
-  now and how often; a goal's actions, wording, schedules, events, triggers and runs. Delete and
-  Remove still ask first. A goal can be deleted, and deleting it also deletes every routine that
-  runs it, the ones that name it by its title included, unless one still runs another open goal or
-  only ran it on some of its firings (below).
-- **New routine is in sections**: what it does, when it starts, when it's done, and where it shows
-  up, as New skill is. Nothing it asks or saves changed.
-- **Routines say what starts a goal in words**, such as "When a GitHub check finishes", and keep
-  the exact event under them on the goal's page.
-- **A Bot's Routines row counts what the Routines page lists**: a goal and the routine that runs it
-  once, and the check-ins that are on.
-- **Completing or deleting a goal does the right thing to its routines, whatever the goal is called
-  now.** A routine made for a goal is switched off when the goal is completed, even after you
-  renamed the goal; it used to stay on and ask a completed goal to run every time it fired. A broad
-  routine that only sometimes runs a goal ("Summarize my inbox, and if a release shipped run the
-  goal") is kept when that goal is completed or deleted, and loses only the link; deleting the goal
-  used to delete it. A routine is never linked to a goal that is already complete or paused, so one
-  that fired as you completed its goal can still be switched back on. A routine made before 0.3.3
-  runs a goal only where its instruction clearly does (the goal's id, or `the goal "Title"`), not
-  wherever it quotes the title, so completing or deleting a goal no longer switches off or deletes a
-  routine that only mentions it. And a Bot is told never to make work you want every time, such as
-  "tell me what changed every morning", end when it is met, which ended it after its first run.
-- **Fixes to Routines and New routine.**
-  - A goal made to start **Now, once** with a Done when ends once that is met, as one on a schedule
-    or an event does. When a schedule or a trigger was added to it later, it repeated, and only you
-    could end it.
-  - Routines are read again every 10 seconds, as goals already were. A goal a run had completed
-    still showed its schedule on, and a goal a Bot had given a schedule said it runs when you ask,
-    until the page was opened again. When routines can't be read, a goal's page says it couldn't
-    load its schedules, where it left them out.
-  - New routine no longer takes over a check-in the Bot already has. If the Bot already checks in
-    on the same thing, Create says so and nothing changes. Before, when the screen hadn't read that
-    check-in yet, it changed it in place and kept it in its own conversation. Accepting a Bot's
-    offer still turns a matching check-in back on.
-  - **Create routine** stays enabled while a field has a message. Pressing it moves to the first
-    field with one, and a screen reader reads each message with its field. After a partial save,
-    focus moves to **Go to Routines**.
-  - A routine that runs a goal, listed on its own when its goal isn't, says "Runs a goal" on its
-    row and its page, where it showed the instruction written for the Bot.
-  - A goal's page asks for Name, What to do and Done when, as New routine does, and a schedule's
-    page calls its instruction What to do. A completed goal's schedules have no switch, since they
-    can't be switched back on.
-  - When your browser's time zone isn't one OpenBot knows, New routine says to ask your Bot to set
-    the routine up. It asked you to choose a time zone the screen doesn't offer.
-
-### Finding things
-
-- **Cmd/Ctrl+K opens a command palette** anywhere signed in. It finds pages, Bots and
-  conversations and opens them; it can't send, approve, run or delete anything, and it never lists
-  a page you can't open. In a Bot's browser the shortcut goes to the browser.
-- **Searching conversations searches all your history on the server**, by name and recent
-  messages, instead of only the conversations already loaded in the sidebar. The new
-  `GET /api/channels/search` uses the conversation list's own rules for who can see what.
-
-### Personal edition
-
-- **Connections lists the search providers, GitHub and Composio's apps.** The built-in Google Drive
-  and Notion are no longer offered, because Composio carries both and listing them twice put two of
-  the same app side by side. One already added stays listed and keeps working.
-- **New routine doesn't offer Slack** as an event source: the personal edition has no Slack, so a
-  goal it started never ran.
-- **A personal owner is never told to ask an admin.** Stopped routines say to restart OpenBot, and
-  a Connections page that couldn't load offers Retry and Setup.
 
 ### Conversations
 
-- **A Bot no longer does an app change twice after you answer an approval.** When a built-in Bot
-  asked for several app changes at once and one of them waited for your Allow, the others that
-  needed no approval still went ahead, but the Bot was told they had not run. It then did them
-  again: a Google Sheet ended up with each new tab twice, as "Summary" and "Summary_2". The Bot is
-  now told what those changes did, and the conversation shows them as done.
-- **A file you attach stays a file once the Bot answers.** On a Bot OpenBot runs in a harness, such
-  as the Personal Assistant on LangChain, a text file you sent turned into one giant block of its
-  own contents when the answer finished, and an image's thumbnail disappeared. A reload showed the
-  same. The message now keeps the file as you sent it, during the answer, after it and after a
-  reload, and the Bot still reads the whole file. Messages already turned into text stay as they
-  are.
-- **Switching back to a conversation the Bot is working in shows it working.** Leave a conversation
-  right after sending, or while the Bot takes a browser step, and come back: the conversation could
-  be empty, your message gone, no sign of the Bot working and the message box open, until the whole
-  answer appeared at once when the Bot was done, minutes later on a long task. A message typed
-  meanwhile started a second run on the same conversation. The conversation now picks the Bot's
-  work up as soon as it continues, so the answer streams in as it is written, and a message typed
-  while the Bot works waits for it, as it does when you never left.
 - **An answer that reaches the screen with pieces missing is put right, and the Bot carries on.**
   Sometimes a run's live stream reached the conversation out of shape while the run itself went
   fine: the answer drew with words missing mid-sentence until a reload, or a step that asked for
@@ -435,37 +1632,8 @@ every deployment:
   message box. A model with thinking levels keeps the picker open on its levels alone, with the
   other models and the search gone, and picking a level closes it.
 
-### Running from source
-
-- **The server runs from the published OpenBot images.** `bash scripts/start.sh` pulls the server,
-  routine worker, computer and supervisor images at the tag in `backend-images.env` and runs them as
-  Compose services, with the app served from the checkout as before. The server's log is
-  `docker compose logs server`. A server and worker an earlier start left running on the host are
-  stopped first. The personal edition's own browser now shows in the page, as in OpenBot Desktop.
-- **The Helm chart is the one published with each release**, installed from its URL; there is no
-  chart in the checkout to build from.
-
 ### Smaller changes
 
-- In the OpenDots skin, the badge on Bots sits on the corner of the Bots icon. It used to hang
-  off the button's corner, past the icon and almost on the rail's edge. A count is now a smaller
-  circle, so the icon still shows under it. The badge on the menu button in a narrow window
-  sits the same way.
-- The OpenMuse skin is now called OpenFuse. Anyone who picked it keeps it, with nothing to
-  choose again.
-- New Bot's first screen ends with a **Bring your own agent** card showing the mark of every
-  framework a custom agent can run on. It opens the same list the **Connect a custom agent** button
-  in the sheet's footer did, and that button is gone.
-- The Bots page lists the Bots you can use first and leaves out empty sections. Bots, Routines,
-  Connections and group conversations draw their rows' shape while they load, and a group
-  conversation that fails to load offers Retry. Needs you says which part didn't load, with Retry,
-  and keeps what did. The message box shows no plus when there is nothing to attach. The Bot's
-  screen opened full size is a modal that returns focus to what opened it, and a finished turn's
-  screenshot uses the full width of a phone. A Bot's Skills page no longer waits for its apps.
-- Connecting an app that takes a key no longer says the app has no sign-in. The dialog said
-  "Fireflies doesn't offer a sign-in here", and Fireflies does have one, just not through the way
-  OpenBot connects it. It now reads "OpenBot connects to Fireflies with a key from your Fireflies
-  account, not a sign-in." for every such app. How the app connects is unchanged.
 - "Backend" is one word everywhere OpenBot shows it: OpenBot Desktop's Status window, tray and
   messages, the app, the server's messages and the Recorder. Desktop's Status window heads its card
   "Backend" where it said "Back end".
@@ -493,9 +1661,6 @@ every deployment:
   the name beside the logo in the sidebar and in each skin, the onboarding header, the OpenBot for
   Business title and menu entry, and the OpenBot Desktop setup window. Mentions in sentences stay
   plain, a deployment with its own product name shows none, and screen readers read the name once.
-- In the personal edition, a Bot's Apps page with no app connected says "Connect one on
-  Connections." and links there. It said to turn one on under Your apps or ask an admin, and the
-  personal edition has neither.
 
 ## 1.0.1
 

@@ -5,12 +5,23 @@ import {
   IconTable,
 } from "@tabler/icons-react";
 import { useRouter } from "@tanstack/react-router";
-import type { ComponentProps } from "react";
+import {
+  type ComponentProps,
+  useEffect,
+  useMemo,
+  useSyncExternalStore,
+} from "react";
 import {
   type CodeHighlighterPlugin,
   defaultRemarkPlugins,
+  type MathPlugin,
+  type PluginConfig,
+  Streamdown,
   type StreamdownProps,
 } from "streamdown";
+import { attachmentUrl as storedAttachmentUrl } from "@openbot/shared/attachments";
+import { attachmentAddress } from "@/lib/channels/attachments";
+import { hasMaths, withMathDelimiters } from "@/lib/maths";
 import {
   NO_SLACK_NAMES,
   remarkSlackMentions,
@@ -142,10 +153,42 @@ function AppLink({
   );
 }
 
+/**
+ * The address a link to a stored file downloads it from, or null for a link that is not one.
+ *
+ * A Bot that sends a file names it in its words, linked to the form a message stores
+ * (`/api/attachments/<id>`, from the send's answer), or now and then to the API's own address. Read
+ * as a page of the app, a click asked the router for it, found no such page and landed on home, so
+ * the person never got the file from the words (found by the end-to-end pass). It is the file, from
+ * the conversation's own address, the one the card's Download button uses.
+ */
+export function fileAddress(path: string): string | null {
+  if (path.startsWith(storedAttachmentUrl(""))) return attachmentAddress(path);
+  return /^\/api\/v2\/organizations\/[^/]+\/attachments\/[^/?#]+/.test(path)
+    ? path
+    : null;
+}
+
 export const markdownComponents = {
   a: ({ href, children, ...rest }: ComponentProps<"a">) => {
     const path = inAppPath(href);
-    if (path !== null)
+    const file = path === null ? null : fileAddress(path);
+    if (file !== null)
+      return (
+        <a
+          {...rest}
+          className="underline underline-offset-2 hover:no-underline"
+          // The server names the file; a download, so it never replaces the conversation.
+          download
+          href={file}
+          rel={undefined}
+          target={undefined}
+        >
+          {children}
+        </a>
+      );
+    // Any other address under /api is the server's, not a page: the router has nothing to open.
+    if (path !== null && !path.startsWith("/api/"))
       return (
         <AppLink {...rest} path={path}>
           {children}
@@ -327,3 +370,83 @@ export function replyRemarkPluginsFor(
 
 /** A reply with no conversation's Slack names to hand: mentions still never show as ids. */
 export const replyRemarkPlugins = replyRemarkPluginsFor(NO_SLACK_NAMES);
+
+let mathPlugin: MathPlugin | undefined;
+let mathLoad: Promise<void> | undefined;
+const mathListeners = new Set<() => void>();
+
+/** Streamdown's maths plugin and KaTeX's stylesheet, fetched the first time a formula is drawn. */
+function loadMathPlugin() {
+  mathLoad ??= import("@/lib/math-plugin")
+    .then(({ math }) => {
+      mathPlugin = math;
+      for (const listener of mathListeners) listener();
+    })
+    .catch((error: unknown) => {
+      // The formula stays drawn as its source; say why rather than leave it so for no reason.
+      console.error("Couldn't load maths rendering:", error);
+      mathLoad = undefined;
+    });
+  return mathLoad;
+}
+
+function onMathPlugin(listener: () => void) {
+  mathListeners.add(listener);
+  return () => {
+    mathListeners.delete(listener);
+  };
+}
+
+const currentMathPlugin = () => mathPlugin;
+
+/** One plugin set per set the caller passes, so Streamdown sees the same object on every render. */
+const withMath = new WeakMap<PluginConfig, PluginConfig>();
+const NO_PLUGINS: PluginConfig = {};
+
+function pluginsWithMath(
+  plugins: PluginConfig | undefined,
+  math: MathPlugin | undefined,
+): PluginConfig | undefined {
+  if (!math) return plugins;
+  const base = plugins ?? NO_PLUGINS;
+  let all = withMath.get(base);
+  if (!all) {
+    all = { ...base, math };
+    withMath.set(base, all);
+  }
+  return all;
+}
+
+/**
+ * Streamdown, for a Bot's words wherever they are drawn, with its maths drawn as formulas.
+ *
+ * Takes everything Streamdown takes. The markdown has its `\( \)` and `\[ \]` written in the `$$`
+ * the maths plugin reads (`lib/maths.ts`), and the plugin is added to the caller's plugins.
+ *
+ * LOADED WITH THE FIRST FORMULA, NOT WITH THE CHAT, as the code plugin is. KaTeX and its stylesheet
+ * are most of the weight of drawing maths, and most conversations have none. The first formula is
+ * drawn as its source for the moment the plugin takes to arrive, then as a formula; every one after
+ * that draws as a formula from the start. Once in, the plugin stays with every surface, so a reply
+ * that grows a formula as it streams keeps the same plugins.
+ */
+export function BotMarkdown({
+  children,
+  plugins,
+  ...props
+}: Omit<StreamdownProps, "children"> & { children: string }) {
+  const markdown = useMemo(() => withMathDelimiters(children), [children]);
+  const wantsMaths = hasMaths(markdown);
+  const math = useSyncExternalStore(
+    onMathPlugin,
+    currentMathPlugin,
+    currentMathPlugin,
+  );
+  useEffect(() => {
+    if (wantsMaths && !math) void loadMathPlugin();
+  }, [wantsMaths, math]);
+  return (
+    <Streamdown {...props} plugins={pluginsWithMath(plugins, math)}>
+      {markdown}
+    </Streamdown>
+  );
+}

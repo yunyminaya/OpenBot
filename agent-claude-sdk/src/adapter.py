@@ -24,6 +24,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from contextlib import suppress
 from dataclasses import dataclass, field, replace
 from typing import get_args
@@ -52,6 +53,7 @@ from claude_agent_sdk import (
 from claude_agent_sdk.types import StreamEvent
 
 from .replay import RESULT_CHARS, cut_note, run_replayed_query, system_instructions
+from .run_model_proxy import query_environment, refresh
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +198,23 @@ def _loaded_upfront_in(server_config, names):
 # A replay holds no result longer than this either (`RESULT_CHARS` in `replay`).
 INLINE_RESULT_CHARS = RESULT_CHARS
 
+# How many times Claude Code retries a failed API request on its own (code.claude.com/docs/en/errors:
+# `CLAUDE_CODE_MAX_RETRIES`, 10 by default, lowered "to surface failures faster in scripts").
+#
+# A delegated task's turn is retried by the server, which sorts the failure first and waits as long
+# as the provider asked. Under that, Claude Code's own ten retries multiply the server's and spend
+# the task's time before the server hears of the failure at all. So a run the server says it
+# retries itself (`forwardedProps.openbotSendOnce`) starts its query with none, and the failure is
+# handed back. Every other run keeps Claude Code's own retries.
+MAX_RETRIES = "CLAUDE_CODE_MAX_RETRIES"
+
+
+def sends_once(forwarded_props) -> bool:
+    """Whether the server retries this run itself, and so wants each request sent once."""
+    props = forwarded_props if isinstance(forwarded_props, dict) else {}
+    return props.get("openbotSendOnce") is True
+
+
 # Claude Code's switch for a model ID it does not know (code.claude.com/docs/en/env-vars).
 #
 # The Claude Code this harness ships (2.1.259, in claude-agent-sdk 0.2.152) predates Opus 5.5,
@@ -232,6 +251,21 @@ READ_TOOL = "Read"
 # tool offered. It runs nothing and reaches nothing outside the session: what it finds is a tool the
 # run was already given, called through OpenBot as before.
 TOOL_SEARCH = "ToolSearch"
+
+# Claude Code's switch for that search (code.claude.com/docs/en/env-vars, `ENABLE_TOOL_SEARCH`).
+#
+# The Claude Code this harness ships (2.1.259) searches by default only when it talks to Anthropic's
+# own API. With `ANTHROPIC_BASE_URL` set, a gateway or a proxy in front of the same API, it leaves
+# the search off unless this is set, and loads every tool it holds upfront
+# (code.claude.com/docs/en/mcp, "Tool search through a gateway": on by default behind one only from
+# 2.1.304). Measured live on one task across three apps, through a proxy that passes every request
+# on to Anthropic unchanged: each request carried 108 to 118 whole tool definitions and 109K to
+# 150K input tokens, and `ToolSearch` was in none of them. Straight to Anthropic's API the same
+# task carried 39 to 61 and 24K to 106K. A deployment behind a gateway is the proxy's shape.
+# Set to `true`, the search is on wherever the model can use it. A gateway has to pass on
+# the `defer_loading` field, `tool_reference` blocks and the `anthropic-beta` header for it; one
+# that cannot is run with `ENABLE_TOOL_SEARCH=false` in this container's environment, which stands.
+ENABLE_TOOL_SEARCH = "ENABLE_TOOL_SEARCH"
 
 # What a full Bot is told `Read` is for. Its own description says it reads any file on "the local
 # filesystem", and the person calls the computer's tool "Read file": asked to read a file on its
@@ -273,15 +307,95 @@ def fitted_result(content):
 
 
 class ModelRefusedError(Exception):
-    """The model provider refused the run, in Claude Code's words for it.
+    """The model provider answered the run with an error, in Claude Code's words for it.
 
-    Claude Code answers a refusal (out of credit, a rate limit, an unknown model, a prompt too long,
-    the API down) with an assistant message of its own, marked with `error`. Streamed as one, it read
-    as the Bot's answer: "API Error: Request rejected (429) · This request would exceed the rate
-    limit …", and the turn finished as if it had worked. It ends the run as a RUN_ERROR instead,
-    coded `OPENBOT_MODEL_REFUSED`, and the server says it in words
-    (server/src/agents/provider-refusal.ts).
+    Claude Code answers a failed request (out of credit, a rate limit, a plan's limit, an unknown
+    model, a prompt too long, the API down, a dropped connection) with an assistant message of its
+    own, marked with `error`. Streamed as one, it read as the Bot's answer: "API Error: Request
+    rejected (429) · This request would exceed the rate limit …", and the turn finished as if it had
+    worked. It ends the run as a RUN_ERROR instead, coded `OPENBOT_MODEL_REFUSED`, and the server says
+    it in words.
+
+    `category` is Claude Code's own name for what went wrong (`error_category`), sent on the
+    RUN_ERROR as `metadata.errorCategory`. Only "refusal" says the model declined to answer; the
+    others say why the request failed. The code stays the one every server reads, so a server that
+    predates the category still places the words as it did.
     """
+
+    def __init__(self, text, category=None):
+        super().__init__(text)
+        self.category = category
+
+
+# What Claude Code calls an error on its message: `AssistantMessageError` in claude-agent-sdk
+# 0.2.152 ("authentication_failed", "billing_error", "rate_limit", "invalid_request",
+# "server_error", "unknown"), and the few more its CLI writes ("model_not_found", "account_on_hold",
+# "oauth_org_not_allowed"). A name, never words: anything else is sent as "unknown".
+CATEGORY = re.compile(r"^[a-z][a-z_]{0,39}$")
+
+
+def error_category(message):
+    """Claude Code's category for a failed message, or "refusal" when the model declined.
+
+    Claude declining to answer is the one real refusal. Claude Code marks it `invalid_request`,
+    the same as a malformed request, and tells them apart only by the message's stop reason.
+    """
+    if getattr(message, "stop_reason", None) == "refusal":
+        return "refusal"
+    error = message.error
+    return error if isinstance(error, str) and CATEGORY.match(error) else "unknown"
+
+
+class ModelUnreachableError(Exception):
+    """Nothing answered at the model's address: the connection was refused, the host doesn't
+    exist, or nothing answered in time. No provider said anything, so it is not a refusal.
+
+    FOUND ON OPENBOT DESKTOP: a base URL with nothing listening at it. Claude Code says so in its
+    own words, which went on as a refusal, and the person read that the provider "turned down the
+    request". It ends the run coded `OPENBOT_MODEL_UNREACHABLE`, and the server puts the step that
+    fits its edition in place of the second sentence.
+    """
+
+
+# Claude Code's own account of a request that never reached the API, as 2.1.259 (claude-agent-sdk
+# 0.2.152) writes it: "API Error: " and then "Connection refused — a firewall or proxy may be blocking
+# it (ConnectionRefused)", "Can't reach the API server — check your internet or DNS (ENOTFOUND)",
+# "No internet route — …", "Unable to connect to API (…)" or "Request timed out. …". Not a dropped
+# connection ("Connection dropped"), which reached the API, and not a certificate or a proxy the
+# person has to fix ("Unable to connect to API: SSL …", "Couldn't connect through your proxy").
+UNREACHED = re.compile(
+    r"^API Error: (?:Connection refused\b|Can't reach the API server\b|No internet route\b"
+    r"|Unable to connect to API\b(?!:)|Request timed out\b)"
+)
+
+
+def model_address():
+    """Where Claude Code reaches the model, as host and port.
+
+    Nothing else of the URL: a base URL can carry a user and password, and some gateways put a key
+    in the path. Claude Code reads `ANTHROPIC_BASE_URL` from this container's environment.
+    """
+    from urllib.parse import urlsplit
+
+    base = (os.environ.get("ANTHROPIC_BASE_URL") or "").strip() or "https://api.anthropic.com"
+    try:
+        parts = urlsplit(base)
+        host, port = parts.hostname, parts.port
+    except ValueError:
+        return None
+    if not host:
+        return None
+    shown = f"[{host}]" if ":" in host else host
+    return f"{shown}:{port}" if port else shown
+
+
+def unreachable_message(address):
+    """The same sentence agent-langgraph-agui ends its run with (`unreachable_message`)."""
+    at = f" at {address}" if address else ""
+    return (
+        f"OpenBot couldn't reach the AI model{at}. "
+        "Check that it's running and the address is right."
+    )
 
 
 def refusal_text(message):
@@ -356,6 +470,9 @@ class _Turn:
     model: str | None = None
     # The newest run's input: the whole thread, with every result the browser has sent so far.
     latest: object = None
+    # Calls on the model endpoint to a tool the step did not offer, which Claude Code answers
+    # itself. See `_not_held`.
+    not_held: set[str] = field(default_factory=set)
 
     def result(self, tool_id):
         if tool_id not in self.results:
@@ -700,6 +817,7 @@ class OpenBotClaudeAgentAdapter(ClaudeAgentAdapter):
         # is the one prop it honours. Every query is built here, so a choice changed between runs
         # starts the next query on it.
         chosen = run_model(input_data.forwarded_props) if input_data else None
+        once = sends_once(input_data.forwarded_props) if input_data else False
         if self._model_only and input_data:
             # The model endpoint accepts prompts and caller-owned tools, never SDK
             # configuration or an ungoverned state-management tool.
@@ -710,7 +828,15 @@ class OpenBotClaudeAgentAdapter(ClaudeAgentAdapter):
         if chosen:
             # After the upstream merge, so the server's choice wins over a forwarded `model`.
             options.model, options.effort = chosen
-        options.env = {**(options.env or {}), UNKNOWN_MODEL_WINDOW: "1"}
+        # On the gateway, the query's calls come back through this harness with the newest run
+        # token of its thread. See run_model_proxy.py.
+        options.env = {
+            **(options.env or {}),
+            UNKNOWN_MODEL_WINDOW: "1",
+            **query_environment(thread_id),
+        }
+        if once:
+            options.env[MAX_RETRIES] = "0"
         options.max_buffer_size = MESSAGE_BUFFER_BYTES
         if not self._model_only and input_data:
             # The model endpoint gets its instructions in context. A full Bot gets its standing
@@ -818,6 +944,10 @@ class OpenBotClaudeAgentAdapter(ClaudeAgentAdapter):
             # And `ToolSearch`, which only finds and loads the definitions of the tools this run
             # already holds (see `TOOL_SEARCH`).
             options.tools = [READ_TOOL, TOOL_SEARCH]
+            # On behind a gateway too, unless whoever runs this container chose otherwise. The SDK
+            # lays `options.env` over the container's own environment, so theirs is read here.
+            if not (os.environ.get(ENABLE_TOOL_SEARCH) or "").strip():
+                options.env[ENABLE_TOOL_SEARCH] = "true"
             # After the Bot's own instructions, which come first.
             prompt = options.system_prompt
             options.system_prompt = (
@@ -868,8 +998,23 @@ class OpenBotClaudeAgentAdapter(ClaudeAgentAdapter):
                     raise ModelAuthenticationError(
                         "Sign in to your model provider again."
                     )
+                if (
+                    isinstance(message, AssistantMessage)
+                    and message.error
+                    and UNREACHED.match(refusal_text(message))
+                ):
+                    # Claude Code's own words stay here, in the log: the sentence replaces them.
+                    logger.warning("The model couldn't be reached: %s", refusal_text(message))
+                    raise ModelUnreachableError(unreachable_message(model_address()))
                 if isinstance(message, AssistantMessage) and message.error:
-                    raise ModelRefusedError(refusal_text(message))
+                    category = error_category(message)
+                    if category == "refusal":
+                        logger.warning("The model declined to answer: %s", refusal_text(message))
+                    else:
+                        logger.warning(
+                            "The model request failed (%s): %s", category, refusal_text(message)
+                        )
+                    raise ModelRefusedError(refusal_text(message), category)
                 if (
                     isinstance(message, StreamEvent)
                     and message.event.get("type") == "message_start"
@@ -1024,13 +1169,18 @@ class OpenBotClaudeAgentAdapter(ClaudeAgentAdapter):
                     RunErrorEvent(message=START_FAILED, code="OPENBOT_HARNESS_START_FAILED")
                 )
                 return
+            category = error.category if isinstance(error, ModelRefusedError) else None
             await turn.queue.put(
                 RunErrorEvent(
                     message=str(error),
+                    # Claude Code's own category, which the server tells the person by.
+                    metadata={"errorCategory": category} if category else None,
                     code="OPENBOT_MODEL_AUTH_REQUIRED"
                     if isinstance(error, ModelAuthenticationError)
                     else "OPENBOT_MODEL_REFUSED"
                     if isinstance(error, ModelRefusedError)
+                    else "OPENBOT_MODEL_UNREACHABLE"
+                    if isinstance(error, ModelUnreachableError)
                     else None,
                 )
             )
@@ -1093,9 +1243,41 @@ class OpenBotClaudeAgentAdapter(ClaudeAgentAdapter):
             }
         )
 
+    def _not_held(self, event, turn):
+        """Whether this event belongs to a call of a tool this step was not offered.
+
+        On the model endpoint the query holds exactly the step's tools (see `run`). The model can
+        still ask for one it does not hold: an app action it knows by name from the conversation, a
+        tool an earlier step was offered, or one it guessed. Claude Code answers such a call itself,
+        with "No such tool available", and the model carries on in the same query. Upstream streams
+        the call as it starts, before Claude Code has looked at it, and the server ends a run that
+        names a tool the step did not offer: FOUND IN DOGFOODING, a Bot asked to add HubSpot deals
+        to a posted Slack update called `SLACK_UPDATES_A_SLACK_MESSAGE`, which it did not hold, and
+        five minutes of work ended on an error. Nothing of such a call is passed on, so the server
+        only ever hears of calls to tools it offered, and the person reads the model's answer.
+        """
+        if not self._model_only:
+            return False
+        if event.type == EventType.TOOL_CALL_START:
+            if event.tool_call_name in turn.tool_names:
+                return False
+            turn.not_held.add(event.tool_call_id)
+            logger.warning(
+                "Claude called a tool this step did not offer; Claude Code answers it: %s",
+                event.tool_call_name,
+            )
+            return True
+        return (
+            event.type
+            in (EventType.TOOL_CALL_ARGS, EventType.TOOL_CALL_END, EventType.TOOL_CALL_RESULT)
+            and event.tool_call_id in turn.not_held
+        )
+
     async def _pump_query(self, input_data, turn, fit_results=False):
         async for event in self._run_query(input_data, fit_results=fit_results):
             event = self._named_as_offered(event, turn)
+            if self._not_held(event, turn):
+                continue
             if event.type == EventType.RUN_ERROR and turn.authentication_failed:
                 event = event.model_copy(
                     update={"code": "OPENBOT_MODEL_AUTH_REQUIRED"}
@@ -1116,6 +1298,8 @@ class OpenBotClaudeAgentAdapter(ClaudeAgentAdapter):
 
     async def run(self, input_data):
         thread_id, run_id = input_data.thread_id, input_data.run_id
+        # A query this run carries on sends its calls with this run's token from now.
+        refresh(thread_id)
         lock = self._segment_locks.setdefault(thread_id, asyncio.Lock())
         async with lock:
             answer_only = (

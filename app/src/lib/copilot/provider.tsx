@@ -5,7 +5,12 @@ import {
 } from "@openbot/shared/person-time-zone";
 import { useQuery } from "@tanstack/react-query";
 import { type ReactNode, useMemo } from "react";
+import { withClientName } from "@/lib/client";
 import { deploymentCapabilitiesQueryOptions } from "@/lib/deployment/queries";
+import {
+  organizationHeaders,
+  useCurrentOrganizationId,
+} from "@/lib/organizations/current";
 import { generativeUiProviderOptions } from "./a2ui";
 import { ActiveBotProvider } from "./active-bot";
 import { BotOffers } from "./bot-offer";
@@ -33,18 +38,31 @@ import { SkillTools } from "./skill-tools";
  * deployment both work without a build-time base URL to get wrong.
  *
  * There is no `publicApiKey`. The Intelligence key and licence token are deployment secrets held by
- * the server; a browser never sees them (see server/src/app.ts, where /api/capabilities projects the
- * runtime rather than returning it).
+ * the server; a browser never sees them (the API's `deployment`, which the app reads what it may do
+ * from, is a projection of the runtime rather than the runtime itself).
  */
 export function CopilotProvider({ children }: { children: ReactNode }) {
   const { data: capabilities } = useQuery(deploymentCapabilitiesQueryOptions());
   const properties = useMemo(() => runProperties(deviceTimeZone()), []);
+  /*
+   * Every runtime request names the organization this tab is working in. The session works in one
+   * organization for every tab, so a tab left in one after a switch in another wrote its message
+   * where it said and ran the Bot where the session said, which had no such Bot. The server runs
+   * it in the one named, when the person is a member of it.
+   */
+  const organization = useCurrentOrganizationId();
+  // And this app, as every request to OpenBot names it (lib/client.ts).
+  const headers = useMemo(
+    () => withClientName(organizationHeaders(organization)),
+    [organization],
+  );
 
   return (
     <CopilotKitProvider
       enableInspector={false}
       runtimeUrl="/api/copilotkit"
       credentials="include"
+      headers={headers}
       properties={properties}
       {...generativeUiProviderOptions(capabilities?.generativeUi)}
       /*

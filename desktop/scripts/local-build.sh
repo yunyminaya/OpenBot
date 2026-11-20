@@ -25,7 +25,8 @@
 #
 # Settings, all optional:
 #   OPENBOT_LOCAL_IMAGES         Images to build from HEAD, space separated. Unset: the harness a
-#                                Claude plan runs. Empty: none, every image comes from the base release
+#                                Claude plan runs and the default Bot. Empty: none, every image comes
+#                                from the base release
 #                                and backend-images.env.
 #   OPENBOT_LOCAL_BASE_RELEASE   Release whose images fill in the rest. Default: the latest release.
 #   OPENBOT_LOCAL_REGISTRY_PORT  Default 5050.
@@ -40,10 +41,12 @@ REGISTRY_NAME="openbot-local-registry"
 REGISTRY_PORT="${OPENBOT_LOCAL_REGISTRY_PORT:-5050}"
 REGISTRY="127.0.0.1:${REGISTRY_PORT}"
 STATE="${OPENBOT_LOCAL_BUILD_DIR:-$HOME/.openbot-local-build}"
-# agent-claude-sdk, the harness a Claude plan picks and the sign-in image. The server (server,
-# migrate, worker), supervisor and agent-computer a Claude-plan install also runs are the published
-# OpenBot images, at the tag in backend-images.env.
-DEFAULT_IMAGES="agent-claude-sdk"
+# agent-claude-sdk, the harness a Claude plan picks and the sign-in image. The server, supervisor
+# and agent-computer a Claude-plan install also runs are the published OpenBot images, at the tag
+# in backend-images.env. And agent-langgraph-ts, the default Bot every other sign-in runs: a base
+# release from before it has no digest to fill it in with, and the manifest must pin every image the
+# published list names.
+DEFAULT_IMAGES="agent-claude-sdk agent-langgraph-ts"
 IMAGES=()
 for image in ${OPENBOT_LOCAL_IMAGES-$DEFAULT_IMAGES}; do IMAGES+=("$image"); done
 
@@ -207,12 +210,13 @@ if [ ! -s "$base" ]; then
   gh release download "$BASE" -R "$REPOSITORY" -p container-images.json -O "$base.tmp"
   mv "$base.tmp" "$base"
 fi
-# The server, computer, supervisor and all-in-one images this commit runs, by the digest the tag in
-# backend-images.env names now, under the names a release's manifest gives them.
+# The OpenBot image (the server and every Bot's computer run from it) and the supervisor's, by the
+# digest the tag in backend-images.env names now, under the names a release's manifest gives them:
+# `openbot`, `server` and `agent-computer` are the one image.
 BACKEND_TAG="$(sed -n 's/^OPENBOT_BACKEND_TAG=//p' backend-images.env | tail -1)"
 [ -n "$BACKEND_TAG" ] || die "backend-images.env names no OPENBOT_BACKEND_TAG"
 PINNED="{}"
-for pair in openbot:openbot server:openbot-server agent-computer:openbot-agent-computer supervisor:openbot-supervisor; do
+for pair in openbot:openbot server:openbot agent-computer:openbot supervisor:openbot-supervisor; do
   name="${pair%%:*}"
   repository="ghcr.io/copilotkit/${pair#*:}"
   digest="$(docker buildx imagetools inspect "$repository:$BACKEND_TAG" --format '{{.Manifest.Digest}}')" \
@@ -223,7 +227,10 @@ for pair in openbot:openbot server:openbot-server agent-computer:openbot-agent-c
 done
 MANIFEST="$STATE/manifests/container-images-$SHORT.json"
 jq --arg version "$VERSION" --arg commit "$COMMIT" --argjson built "$BUILT" --argjson pinned "$PINNED" \
-  '.version = $version | .commit = $commit | .images += $pinned | .images += $built' "$base" > "$MANIFEST"
+  '.version = $version | .commit = $commit | .images += $pinned | .images += $built
+   # The OpenBot image under two more names, as a release writes them (.github/workflows/images.yml):
+   # kept for one release, so the 1.0.2 and 1.0.3 apps can start an installation this build updated.
+   | .images["agent-bot"] = .images.server | .images["agent-langgraph"] = .images.server' "$base" > "$MANIFEST"
 # Every image the published list names must be pinned, or the app refuses the manifest at Install.
 jq -e --slurpfile names .github/published-images.json \
   '[$names[0][] as $n | .images[$n].reference // "" | test("@sha256:[0-9a-f]{64}$")] | all' \
