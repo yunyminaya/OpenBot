@@ -10,9 +10,41 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
 
 **Before upgrading.**
 
-- **One migration, expand only.** `0138_management_enrollment` adds one table for connecting to
-  managed updates (below), which 1.1.2 never reads, so 1.1.2 upgrades with its servers rolling one
-  by one, with no downtime, and goes back to 1.1.2 the same way.
+- **Migrations run at start: eleven, and none removes anything.** The database moves from
+  `0137_ai_connections`, where 1.1.2 left it, to `0148_recorder_capture_passes`. A 1.1.2 server
+  works against the new schema, so 1.1.2 upgrades with its servers rolling one by one, with no
+  downtime, and goes back to 1.1.2 the same way.
+  - `0138_management_enrollment` keeps the connection to managed updates (below).
+  - `0139_organization_intelligence` binds each organization to its own Intelligence organization,
+    project and key.
+  - `0140_hosted_organization_authority` records who each person is at a hosted OpenBot's
+    organization authority.
+  - `0141_person_spaces_per_organization` keeps a person's own Learning space under one id in every
+    organization.
+  - `0142_deployment_audit_events` adds the installation's own audit trail.
+  - `0143_crossorg_data` gives what crossed organizations its organization: the phones registered
+    for push, a person's preferences and onboarding, and calls to the vendor accounts the deployment
+    shares.
+  - `0144_crossorg_data_keys` and `0147_member_search_indexes` build their indexes concurrently,
+    outside a transaction, so writes go on while they build.
+  - `0145_retired_tables_recopy` copies into their new homes the rows an older replica wrote to the
+    fourteen tables `0096_data_model_copy` folded, after that copy ran, and stops the start if any
+    of them cannot arrive. Nothing is dropped.
+  - `0146_pg_trgm` creates PostgreSQL's `pg_trgm` extension, for member search. It is a trusted
+    extension, so the role that owns OpenBot's database creates it without a superuser.
+  - `0148_recorder_capture_passes` keeps the passes that let a Recorder's socket through the
+    gateway relay.
+- **`OPENBOT_MULTIPLE_ORGANIZATIONS` is no longer read: `OPENBOT_ORGANIZATION_AUTHORITY` says
+  how many organizations an OpenBot holds.** A self-hosted OpenBot that held more than one with
+  `OPENBOT_MULTIPLE_ORGANIZATIONS=true` sets `OPENBOT_ORGANIZATION_AUTHORITY=intelligence-platform`
+  and `INTELLIGENCE_PLATFORM_TOKEN` (or `INTELLIGENCE_PLATFORM_TOKEN_FILE`), the platform service
+  token its Intelligence was given, before upgrading. At the first start each organization it held
+  other than `default` is given an Intelligence organization of its own and starts fresh there:
+  its earlier conversation history, Learning and memory stay with `default` and aren't moved,
+  while its members, Bots and settings are kept. Left as it was, or with the old setting removed
+  and no authority named, it refuses to start before migrating, naming the organizations and what
+  to set: on `local` their Bots could not answer. An OpenBot that only ever held one organization
+  changes nothing, and keeps it. See [configuration](docs/configuration.md#general-variables).
 - **Deprecated.** Each still works, answers with `Deprecation` and `Sunset` headers, and is
   removed no earlier than its sunset, and only once nothing uses it.
   - `PATCH /api/v2/organizations/{organizationId}/people/{personId} body role`: Sunset 2028-05-19.
@@ -66,13 +98,91 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
   `hostedSignIn` on `deployment`, true where people sign in through OpenBot by CopilotKit's own
   sign-in, starting at `/api/auth/hosted/sign-in`.
 
+- **One Bot's conversations.** `listConversations` takes `botId` and lists the conversations that
+  Bot takes part in, one-Bot and group alike, in the same order and pages. It can't be combined
+  with `q`: both together are a 400.
+- **When a Bot's latest conversation was.** A Bot from `listBots` carries `lastConversationAt`: the
+  caller's latest conversation with it, by its last message or its start, or null when there is
+  none.
+
+### The sidebar
+
+- **A strip of sections beside a panel.** Each icon on the strip opens a section; the account is
+  the avatar at its foot. Conversations and Bots have a panel beside the strip, and any other
+  section folds the panel away so its page takes the width. ⌘B, or the Conversations icon, brings
+  the panel back without leaving the page.
+- **Compact conversations by default.** Each conversation is one line: a small avatar, the title
+  and the time, with the unread and pin marks. Settings, Appearance, Conversation list switches
+  back to Detailed, in this browser. Message list emphasis applies to Detailed only.
+- **A Bots panel.** Every Bot, ordered by its latest conversation. The top three open with their
+  five latest conversations, and Show more lists the next five.
+- **Agents are hidden for now.** The Agents page is out of the menu and `/agents` goes home. A
+  Bot's page has no Agents row, and `/bots/<id>/agents` goes to the Bot's page.
+
+### Organizations in the app
+
+- **An owner can delete an organization.** Settings, Organization has a Delete section for its
+  owners, which asks for the organization's name first. A person's own organization and `default`
+  can't be deleted, and the dialog says so. Afterwards the person moves to another of theirs.
+- **Each API key says where it works.** A key's row names the organization it acts in, and a key
+  made before keys belonged to one reads as `default`'s.
+- **Require SSO, per organization.** A member an organization holds out until they sign in through
+  their company gets a page that says why, with Link your company account (one button per
+  provider), Switch organization to their others, and Sign out, where they saw an error box. It
+  takes over at once when the rule is turned on while they have OpenBot open. Settings, General
+  offers the same link, or says the account is linked. Outside `default`, Identity providers lists
+  the organization's own providers, and the ones set up for all of OpenBot read-only; once the
+  organization has its own, the others no longer count for its rule, and each says so.
+- **Members who haven't opened OpenBot yet** show on Settings, Organization as such, with no role to
+  change, and can be removed.
+- **A computer refused for good** (an organization at its computer limit) is a calm state with the
+  server's sentence and no Try again, on Teach a Bot and on a Bot's screen. An admin gets a link to
+  Admin, Computers.
+- **Somebody signed in but in no organization** gets a page that says so, with Try again and Sign
+  out, on every page.
+- **A hosted OpenBot** offers Continue with OpenBot by CopilotKit on the sign-in screen, says an
+  invitation arrives by email from OpenBot by CopilotKit, renews its hosted sign-in when an admin
+  action needs it and sends that action again once, and no longer offers folders from this
+  computer in Admin, Computers.
+- **Learning** names the organization's own default space where it said "Deployment default", and
+  the sidebar takes only the conversation events of the organization the person works in.
+- **A person outside `default` signs in with nothing refused on the way**: what OpenBot offers is
+  read as anybody until their organization is known.
+- **Adding people to a team finds them as you type.** Add person searches the organization's own
+  members by name or email from the first letter, best matches first, and completes the best one in
+  the box: Tab takes it, Enter adds, the arrow keys move through the list. Several people can be
+  added in a row, and somebody already in the team is shown as such.
+
+### The phone app
+
+- **It works in one organization at a time.** A person in several picks one on Home, and the pick
+  is kept on the phone for that person and that OpenBot. Removed from it, or with it deleted, they
+  move to another of theirs, or are told they are in none.
+- **Require SSO.** Held out until they sign in through their company, the phone shows why, with Link
+  your company account, Switch organization and Sign out. Link opens a single-use address in the
+  system browser and comes back to the app once the account is linked.
+- Signing out stops push notifications from each of the person's organizations.
+
 ### OpenBot Desktop
 
 - **OpenBot Desktop's back end moves to CopilotKit Intelligence 0.17.0-rc.4.** The bundled CLI
   moves to `copilotkit@3e64135`, so an install or update runs Intelligence 0.17.0-rc.4.
+- **Setup no longer stops for good after the back end's saved settings were deleted.** With
+  OpenBot's Podman machine removed and the back end's folder deleted by hand, but the CopilotKit
+  CLI's record of it kept, every setup stopped with "OpenBot can't run on this computer as it's set
+  up." until that record was removed by hand. Setup now forgets that back end and sets up a new
+  one.
 
 ### Kubernetes
 
+- **A team install is connected to CopilotKit's management service by default; upgrades stay
+  yours to set up.** The `openbot` chart (and `openbot-bundle`) installs the management agent into
+  `openbot-system` without Flux: it enrolls by licence, sends its heartbeat and runs restart and
+  support-bundle commands, and reports that upgrades are not set up. It refuses pause, resume and
+  rollback, and a desired version waits, until upgrades are set up with the `openbot-agent`
+  release, which takes over with the same certificate. A cluster's own Flux is not touched. Turn it
+  off with `management.enabled=false` (`openbot.management.enabled=false` on the bundle). See
+  [docs/managed-upgrades.md](docs/managed-upgrades.md).
 - **An admin can turn on managed updates from Admin.** Admin, Managed updates, Connect shows a
   code to approve at CopilotKit's page, signed in with your OpenBot account as an admin of the
   organization your licence names. Once it's approved, it shows one `helm install` of
@@ -124,6 +234,11 @@ Newest first. `Unreleased` is what is on `main` and not yet tagged.
   `CHECK_ORIGIN`, even where that setting can't be the cause. Now, when the connection goes through
   OpenBot's own address, it says OpenBot refused it. Only when the connection goes to another
   address does it name the `chrome-extension://` origin an admin must allow there.
+- **The Recorder records into an organization.** The popup and the Connect page name it, and a
+  connection stays with the organization it was made in.
+- **The Recorder and Require SSO.** Held out until they sign in through their company, the popup
+  says so, offers Sign in with your company, and pauses Learning capture with the events kept, where
+  it said it got an answer it didn't know.
 
 ## 1.1.2
 
